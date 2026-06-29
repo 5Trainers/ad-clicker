@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# App runtime artifacts
+click_log.csv
+clicker_config.json
+*.png
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
