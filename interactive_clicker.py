@@ -457,11 +457,13 @@ def run(keyword: str | None, times: int, delay: float, log_path: str) -> int:
             pass
 
 
-# Injected into a fresh Google results tab: find the result link whose
-# host+path matches the locked target and click it (opening it in that tab).
-# Returns the clicked href, or null if the target isn't on this results page.
-FIND_AND_CLICK_JS = r"""
-(function (target) {
+# Injected into a fresh Google results (page 1) tab. Builds the ordered list of
+# organic result links (those carrying an <h3> title), finds the locked target,
+# and clicks it if it is present. With tail > 0 it skips the target when it
+# ranks within the last `tail` results; tail = 0 never skips by position.
+# Returns a status object: clicked | absent | toolow | badtarget.
+CHECK_AND_CLICK_JS = r"""
+(function (target, tail) {
   function norm(u) {
     try {
       var x = new URL(u);
@@ -469,20 +471,37 @@ FIND_AND_CLICK_JS = r"""
     } catch (e) { return ''; }
   }
   var want = norm(target);
-  if (!want) { return null; }
-  var as = document.querySelectorAll('a[href]');
-  for (var i = 0; i < as.length; i++) {
-    if (norm(as[i].href) === want) {
-      as[i].scrollIntoView({ block: 'center' });
-      as[i].click();
-      return as[i].href;
-    }
+  if (!want) { return { status: 'badtarget' }; }
+
+  // Ordered, de-duplicated organic results within the main results column.
+  var seen = {}, list = [];
+  var h3s = document.querySelectorAll('#search h3, #rso h3');
+  for (var i = 0; i < h3s.length; i++) {
+    var a = h3s[i].closest('a');
+    if (!a || !a.href || a.href.indexOf('http') !== 0) { continue; }
+    var n = norm(a.href);
+    if (seen[n]) { continue; }
+    seen[n] = 1;
+    list.push({ n: n, a: a });
   }
-  return null;
-})(arguments[0]);
+  var total = list.length;
+  var idx = -1;
+  for (var j = 0; j < total; j++) {
+    if (list[j].n === want) { idx = j; break; }
+  }
+  if (idx < 0) { return { status: 'absent', total: total }; }
+  if (idx >= total - tail) {
+    return { status: 'toolow', index: idx, total: total };
+  }
+  var el = list[idx].a;
+  el.scrollIntoView({ block: 'center' });
+  el.click();
+  return { status: 'clicked', index: idx, total: total, href: el.href };
+})(arguments[0], arguments[1]);
 """
 
-BATCH_SIZE = 10
+# Click the target wherever it ranks on page 1 (0 = never skip by position).
+EXCLUDE_LAST = 0
 
 
 def _wait_loaded(driver, timeout: float) -> None:
@@ -494,78 +513,71 @@ def _wait_loaded(driver, timeout: float) -> None:
         pass
 
 
-def run_keyword_batch(driver, google_tab: str, keyword: str, target: str,
-                      delay: float, logger: CsvLogger, batch_no: int,
-                      clicks) -> int:
-    """Open BATCH_SIZE search tabs for *keyword* as fast as possible, then go
-    tab by tab: click the matching target, wait for it to fully load, close the
-    tab, move on. Returns clicks landed this batch."""
+def keyword_search_once(driver, google_tab: str, keyword: str, target: str,
+                        logger: CsvLogger, iteration: int, clicks,
+                        ua: str, first: bool) -> str:
+    """One pass: open a fresh tab, search page 1, and click the target wherever
+    it ranks on page 1 (subject to EXCLUDE_LAST). Then (if clicked)
+    wait for full load and close the tab. Returns the status string.
+    Always returns focus to *google_tab*."""
     search_url = "https://www.google.com/search?q=" + quote_plus(keyword)
-    handles = []
-    last_ua = None
-    # 1) Open all tabs quickly — navigate via JS so we DON'T block on load.
-    for i in range(BATCH_SIZE):
-        ua = pick_user_agent(last_ua)
-        last_ua = ua
-        driver.switch_to.new_window("tab")
-        try:
-            driver.execute_cdp_cmd(
-                "Network.setUserAgentOverride", {"userAgent": ua})
-        except WebDriverException:
-            pass
-        try:
-            # Fire the navigation and return immediately (no page-load wait).
-            driver.execute_script("window.location.href = arguments[0];",
-                                  search_url)
-        except WebDriverException:
-            pass
-        handles.append((driver.current_window_handle, ua))
-    # 2) Process each tab one by one: click target -> wait full load -> close.
-    landed = 0
-    first = True
-    for (h, ua) in handles:
-        try:
-            driver.switch_to.window(h)
-        except WebDriverException:
-            continue
-        # Make sure the results page is ready before searching for the link.
-        try:
-            WebDriverWait(driver, 15).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "div#search")))
-        except (TimeoutException, WebDriverException):
-            pass
-        if first:
-            dismiss_consent(driver)
-            first = False
-        try:
-            href = driver.execute_script(FIND_AND_CLICK_JS, target)
-        except WebDriverException:
-            href = None
-        if href:
-            landed += 1
-            clicks[0] += 1
-            # Wait until the opened target page has FULLY loaded, then close.
-            _wait_loaded(driver, 30)
-            print(f"       batch {batch_no} click {landed}: opened {href}")
-            logger.log("kw_click", keyword=keyword, url=href,
-                       click=clicks[0], total=batch_no, user_agent=ua,
-                       detail=f"batch{batch_no}")
-        else:
-            logger.log("kw_miss", keyword=keyword, url=target,
-                       total=batch_no, user_agent=ua,
-                       detail=f"batch{batch_no}:not_found")
-        # Close this tab and move to the next one.
-        try:
-            driver.close()
-        except WebDriverException:
-            pass
+    driver.switch_to.new_window("tab")
+    try:
+        driver.execute_cdp_cmd(
+            "Network.setUserAgentOverride", {"userAgent": ua})
+    except WebDriverException:
+        pass
+    try:
+        driver.get(search_url)
+    except WebDriverException:
+        pass
+    # Wait for page-1 results before judging rank.
+    try:
+        WebDriverWait(driver, 15).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "div#search")))
+    except (TimeoutException, WebDriverException):
+        pass
+    if first:
+        dismiss_consent(driver)
+
+    try:
+        res = driver.execute_script(CHECK_AND_CLICK_JS, target, EXCLUDE_LAST)
+    except WebDriverException:
+        res = None
+    res = res or {"status": "error"}
+    status = res.get("status", "error")
+
+    if status == "clicked":
+        clicks[0] += 1
+        _wait_loaded(driver, 30)   # close only after it fully loads
+        print(f"    iter {iteration}: clicked rank {res.get('index', '?')}"
+              f"/{res.get('total', '?')} -> {res.get('href', '')}")
+        logger.log("kw_click", keyword=keyword, url=res.get("href", ""),
+                   click=clicks[0], total=res.get("total", ""), user_agent=ua,
+                   detail=f"iter{iteration}:rank{res.get('index', '?')}")
+    else:
+        note = {"absent": "not on page 1", "toolow": "in last 5",
+                "badtarget": "bad target url", "error": "check failed"}.get(
+                    status, status)
+        print(f"    iter {iteration}: skip ({note}, "
+              f"rank {res.get('index', '-')}/{res.get('total', '-')})")
+        logger.log("kw_skip", keyword=keyword, url=target,
+                   total=res.get("total", ""), user_agent=ua,
+                   detail=f"iter{iteration}:{status}")
+
+    try:
+        driver.close()
+    except WebDriverException:
+        pass
     driver.switch_to.window(google_tab)
-    return landed
+    return status
 
 
 def run_keyword_mode(keyword: str | None, delay: float, log_path: str) -> int:
-    """Lock a target result for *keyword*, then repeatedly open batches of
-    BATCH_SIZE search tabs and click that target until the user presses Stop."""
+    """Lock a target result for *keyword*, then repeatedly search page 1 and
+    click that target wherever it ranks on page 1, waiting for full load before
+    closing, until the user presses Stop. *delay* is the pause between searches
+    (default 0)."""
     if not keyword:
         print("[!] Keyword mode needs a keyword.")
         return 1
@@ -603,44 +615,52 @@ def run_keyword_mode(keyword: str | None, delay: float, log_path: str) -> int:
         print(f"[*] Target locked: {target}")
         logger.log("kw_target", keyword=keyword, url=target)
 
-        # Phase 2: batch loop until Stop.
+        # Phase 2: search-check-click loop until Stop.
         try:
             driver.execute_script("window.__beginRun && window.__beginRun();")
         except WebDriverException:
             pass
         clicks = [0]
-        batch = 0
+        it = 0
+        last_ua = None
         while True:
             if _stop_requested(driver):
                 break
-            batch += 1
+            it += 1
             try:
                 driver.execute_script(
                     "window.__setBadge && window.__setBadge(arguments[0]);",
-                    f"Batch {batch} • {clicks[0]} opens")
+                    f"Search {it} • {clicks[0]} clicks")
             except WebDriverException:
                 print("[*] Browser closed — exiting.")
                 logger.log("browser_closed")
                 return 0
-            print(f"[*] Batch {batch}: opening {BATCH_SIZE} search tabs…")
+            ua = pick_user_agent(last_ua)
+            last_ua = ua
             try:
-                landed = run_keyword_batch(driver, google_tab, keyword, target,
-                                           delay, logger, batch, clicks)
+                keyword_search_once(driver, google_tab, keyword, target,
+                                    logger, it, clicks, ua, first=(it == 1))
             except WebDriverException:
                 print("[*] Browser closed — exiting.")
                 logger.log("browser_closed")
                 return 0
-            print(f"[+] Batch {batch}: {landed}/{BATCH_SIZE} opened "
-                  f"(total {clicks[0]}).")
             try:
                 driver.execute_script(
                     "window.__setBadge && window.__setBadge(arguments[0]);",
-                    f"Batch {batch} done • {clicks[0]} opens")
+                    f"Search {it} done • {clicks[0]} clicks")
             except WebDriverException:
                 break
+            # Optional pause between searches (default 0 = no delay).
+            if delay > 0 and not _stop_requested(driver):
+                waited = 0.0
+                while waited < delay:
+                    if _stop_requested(driver):
+                        break
+                    time.sleep(0.2)
+                    waited += 0.2
 
-        print(f"[*] Stopped after {batch} batch(es), {clicks[0]} opens.")
-        logger.log("kw_stopped", keyword=keyword, click=clicks[0], total=batch)
+        print(f"[*] Stopped after {it} search(es), {clicks[0]} clicks.")
+        logger.log("kw_stopped", keyword=keyword, click=clicks[0], total=it)
         try:
             driver.execute_script("window.__hideProgress && window.__hideProgress();")
         except WebDriverException:
@@ -667,8 +687,9 @@ CONFIG_FILE = "clicker_config.json"
 DEFAULT_CONFIG = {
     "times": 10,
     "delay": 5.0,
+    "kw_delay": 0.0,   # keyword mode: pause between searches (0 = no delay)
     "log": "click_log.csv",
-    "keyword": "",   # blank = type the search by hand in the browser
+    "keyword": "",     # blank = type the search by hand in the browser
 }
 
 
@@ -699,12 +720,13 @@ def _prompt(label: str, current) -> str:
 def settings_menu(cfg: dict) -> None:
     while True:
         print("\n--- Settings ---")
-        print(f"  1) Default clicks per link ... {cfg['times']}")
-        print(f"  2) Delay between clicks (s) .. {cfg['delay']}")
-        print(f"  3) Default keyword ........... "
+        print(f"  1) Default clicks per link ..... {cfg['times']}")
+        print(f"  2) Delay between clicks (s) .... {cfg['delay']}")
+        print(f"  3) Keyword-mode delay (s) ...... {cfg['kw_delay']}")
+        print(f"  4) Default keyword ............. "
               f"{cfg['keyword'] or '(type manually)'}")
-        print(f"  4) Log file .................. {cfg['log']}")
-        print("  5) Back")
+        print(f"  5) Log file .................... {cfg['log']}")
+        print("  6) Back")
         choice = input("Select: ").strip()
         if choice == "1":
             raw = _prompt("Clicks per link", cfg["times"])
@@ -721,17 +743,24 @@ def settings_menu(cfg: dict) -> None:
                 except ValueError:
                     print("  [!] Enter a number.")
         elif choice == "3":
+            raw = _prompt("Keyword-mode delay seconds", cfg["kw_delay"])
+            if raw:
+                try:
+                    cfg["kw_delay"] = max(0.0, float(raw))
+                except ValueError:
+                    print("  [!] Enter a number.")
+        elif choice == "4":
             raw = _prompt("Keyword (blank to clear)", cfg["keyword"])
             cfg["keyword"] = raw
-        elif choice == "4":
+        elif choice == "5":
             raw = _prompt("Log file path", cfg["log"])
             if raw:
                 cfg["log"] = raw
-        elif choice == "5":
+        elif choice == "6":
             save_config(CONFIG_FILE, cfg)
             return
         else:
-            print("  [!] Pick 1-5.")
+            print("  [!] Pick 1-6.")
 
 
 def format_logs(log_path: str, tail: int = 50) -> str:
@@ -798,7 +827,7 @@ def terminal_menu(cfg: dict) -> int:
             if kw:
                 cfg["keyword"] = kw
                 try:
-                    run_keyword_mode(kw, cfg["delay"], cfg["log"])
+                    run_keyword_mode(kw, cfg["kw_delay"], cfg["log"])
                 except KeyboardInterrupt:
                     print("\n[*] Interrupted — back to menu.")
             else:
@@ -891,7 +920,7 @@ def launch_gui(cfg: dict) -> int:
         kw = kw.strip()
         cfg["keyword"] = kw
         _run_session(
-            lambda: run_keyword_mode(kw, cfg["delay"], cfg["log"]),
+            lambda: run_keyword_mode(kw, cfg["kw_delay"], cfg["log"]),
             "Keyword auto-click running… (press ■ Stop in the browser)")
 
     def view_logs():
@@ -911,11 +940,13 @@ def launch_gui(cfg: dict) -> int:
     def open_settings():
         win = tk.Toplevel(root)
         win.title("Settings")
-        win.geometry("380x300")
+        win.geometry("400x360")
         win.configure(bg="#1f2937")
         fields = {
-            "Clicks per link": ("times", str(cfg["times"])),
+            "Clicks per link (normal mode)": ("times", str(cfg["times"])),
             "Delay between clicks (s)": ("delay", str(cfg["delay"])),
+            "Keyword-mode delay between searches (s)":
+                ("kw_delay", str(cfg["kw_delay"])),
             "Default keyword (blank = manual)": ("keyword", cfg["keyword"]),
             "Log file": ("log", cfg["log"]),
         }
@@ -932,9 +963,11 @@ def launch_gui(cfg: dict) -> int:
             try:
                 cfg["times"] = max(1, int(entries["times"].get().strip()))
                 cfg["delay"] = max(0.0, float(entries["delay"].get().strip()))
+                cfg["kw_delay"] = max(
+                    0.0, float(entries["kw_delay"].get().strip()))
             except ValueError:
                 messagebox.showerror(
-                    "Invalid", "Clicks must be a whole number and delay a number.")
+                    "Invalid", "Clicks must be a whole number and delays numbers.")
                 return
             cfg["keyword"] = entries["keyword"].get().strip()
             log_val = entries["log"].get().strip()

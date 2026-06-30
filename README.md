@@ -1,7 +1,7 @@
 # Keyword Search & Click
 
 A small cross-platform (Linux / Windows / macOS) Python tool that searches a
-keyword on Google and clicks the **first organic search result**.
+keyword on Google and lets you click an organic search result multiple times.
 
 ## Requirements
 
@@ -24,19 +24,6 @@ pip install -r requirements.txt
 ```
 
 ## Usage
-
-```bash
-# search and click the first result (browser visible)
-python search_click.py "python tutorials"
-
-# run without a visible window
-python search_click.py "python tutorials" --headless
-
-# click the 2nd result instead of the 1st
-python search_click.py "news" --rank 2
-```
-
-## Interactive clicker (hover → box → click N times)
 
 `interactive_clicker.py` opens Google, runs your search, then overlays a blue
 **"Click ×N"** box on whichever result you hover. Clicking that box opens that
@@ -69,4 +56,3 @@ the browser window to quit.
 - If you need reliable, ToS-compliant search programmatically, use the
   **Google Custom Search JSON API** or a service like **SerpAPI** instead of
   driving a browser. Ask and I'll wire that up.
-```
