@@ -131,7 +131,10 @@ OVERLAY_JS = r"""
         if (href.indexOf('http') !== 0) { return false; }
         var host;
         try { host = new URL(href).hostname; } catch (e) { return false; }
-        if (isInternal(host)) { return false; }   // skip google's own links
+        // Skip Google's own nav links, but KEEP sponsored/ad links — those ride
+        // on google.com/aclk or googleadservices.com redirects.
+        var isAd = /[?&\/]aclk|googleadservices\.com|\/pagead\//i.test(href);
+        if (isInternal(host) && !isAd) { return false; }
         var r = a.getBoundingClientRect();
         if (r.width === 0 && r.height === 0) { return false; }  // skip hidden
         return true;
@@ -457,53 +460,6 @@ def run(keyword: str | None, times: int, delay: float, log_path: str) -> int:
             pass
 
 
-# Injected into a fresh Google results (page 1) tab. Builds the ordered list of
-# organic result links (those carrying an <h3> title), finds the locked target,
-# and clicks it if it is present. With tail > 0 it skips the target when it
-# ranks within the last `tail` results; tail = 0 never skips by position.
-# Returns a status object: clicked | absent | toolow | badtarget.
-CHECK_AND_CLICK_JS = r"""
-(function (target, tail) {
-  function norm(u) {
-    try {
-      var x = new URL(u);
-      return (x.hostname + x.pathname.replace(/\/+$/, '')).toLowerCase();
-    } catch (e) { return ''; }
-  }
-  var want = norm(target);
-  if (!want) { return { status: 'badtarget' }; }
-
-  // Ordered, de-duplicated organic results within the main results column.
-  var seen = {}, list = [];
-  var h3s = document.querySelectorAll('#search h3, #rso h3');
-  for (var i = 0; i < h3s.length; i++) {
-    var a = h3s[i].closest('a');
-    if (!a || !a.href || a.href.indexOf('http') !== 0) { continue; }
-    var n = norm(a.href);
-    if (seen[n]) { continue; }
-    seen[n] = 1;
-    list.push({ n: n, a: a });
-  }
-  var total = list.length;
-  var idx = -1;
-  for (var j = 0; j < total; j++) {
-    if (list[j].n === want) { idx = j; break; }
-  }
-  if (idx < 0) { return { status: 'absent', total: total }; }
-  if (idx >= total - tail) {
-    return { status: 'toolow', index: idx, total: total };
-  }
-  var el = list[idx].a;
-  el.scrollIntoView({ block: 'center' });
-  el.click();
-  return { status: 'clicked', index: idx, total: total, href: el.href };
-})(arguments[0], arguments[1]);
-"""
-
-# Click the target wherever it ranks on page 1 (0 = never skip by position).
-EXCLUDE_LAST = 0
-
-
 def _wait_loaded(driver, timeout: float) -> None:
     """Block until the active tab reports document.readyState == 'complete'."""
     try:
@@ -513,13 +469,14 @@ def _wait_loaded(driver, timeout: float) -> None:
         pass
 
 
-def keyword_search_once(driver, google_tab: str, keyword: str, target: str,
-                        logger: CsvLogger, iteration: int, clicks,
-                        ua: str, first: bool) -> str:
-    """One pass: open a fresh tab, search page 1, and click the target wherever
-    it ranks on page 1 (subject to EXCLUDE_LAST). Then (if clicked)
-    wait for full load and close the tab. Returns the status string.
-    Always returns focus to *google_tab*."""
+def keyword_search_once(driver, google_tab: str, keyword: str,
+                        target_domain: str, logger: CsvLogger, iteration: int,
+                        clicks, ua: str, first: bool) -> str:
+    """One pass: open a fresh tab, search page 1, and click the first result
+    (ad or organic) whose destination domain matches *target_domain*. The exact
+    URL need not match — only the domain — because ad URLs change every load.
+    Then (if clicked) wait for full load and close the tab. Returns the status
+    string. Always returns focus to *google_tab*."""
     search_url = "https://www.google.com/search?q=" + quote_plus(keyword)
     driver.switch_to.new_window("tab")
     try:
@@ -531,7 +488,7 @@ def keyword_search_once(driver, google_tab: str, keyword: str, target: str,
         driver.get(search_url)
     except WebDriverException:
         pass
-    # Wait for page-1 results before judging rank.
+    # Wait for page-1 results before scanning for the target domain.
     try:
         WebDriverWait(driver, 15).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, "div#search")))
@@ -541,7 +498,7 @@ def keyword_search_once(driver, google_tab: str, keyword: str, target: str,
         dismiss_consent(driver)
 
     try:
-        res = driver.execute_script(CHECK_AND_CLICK_JS, target, EXCLUDE_LAST)
+        res = driver.execute_script(CLICK_BY_DOMAIN_JS, target_domain)
     except WebDriverException:
         res = None
     res = res or {"status": "error"}
@@ -550,18 +507,17 @@ def keyword_search_once(driver, google_tab: str, keyword: str, target: str,
     if status == "clicked":
         clicks[0] += 1
         _wait_loaded(driver, 30)   # close only after it fully loads
-        print(f"    iter {iteration}: clicked rank {res.get('index', '?')}"
-              f"/{res.get('total', '?')} -> {res.get('href', '')}")
+        kind = "ad" if res.get("ad") else "result"
+        print(f"    iter {iteration}: clicked {kind} {res.get('domain', '')} "
+              f"-> {res.get('href', '')}")
         logger.log("kw_click", keyword=keyword, url=res.get("href", ""),
                    click=clicks[0], total=res.get("total", ""), user_agent=ua,
-                   detail=f"iter{iteration}:rank{res.get('index', '?')}")
+                   detail=f"iter{iteration}:{res.get('domain', '')}")
     else:
-        note = {"absent": "not on page 1", "toolow": "in last 5",
-                "badtarget": "bad target url", "error": "check failed"}.get(
-                    status, status)
-        print(f"    iter {iteration}: skip ({note}, "
-              f"rank {res.get('index', '-')}/{res.get('total', '-')})")
-        logger.log("kw_skip", keyword=keyword, url=target,
+        note = {"absent": f"domain '{target_domain}' not on page 1",
+                "error": "check failed"}.get(status, status)
+        print(f"    iter {iteration}: skip ({note})")
+        logger.log("kw_skip", keyword=keyword, url=target_domain,
                    total=res.get("total", ""), user_agent=ua,
                    detail=f"iter{iteration}:{status}")
 
@@ -573,7 +529,273 @@ def keyword_search_once(driver, google_tab: str, keyword: str, target: str,
     return status
 
 
-def run_keyword_mode(keyword: str | None, delay: float, log_path: str) -> int:
+# Shared finder: returns ALL sponsored (ad) blocks on the page — top, inline
+# (between organic results), and bottom. Google labels every ad with a bold
+# "Sponsored" tag; ads may also sit in #tads / #tadsb / #bottomads or carry a
+# data-text-ad attribute. We gather from every signal so no ad is missed, then
+# de-duplicate so nested matches collapse to a single outermost block.
+_FIND_SPONSORED_JS = r"""
+  function _trim(s) { return (s || '').replace(/\s+/g, ' ').trim(); }
+  function _visible(el) {
+    if (!el) { return false; }
+    var r = el.getBoundingClientRect();
+    if (r.width === 0 && r.height === 0) { return false; }
+    var s = window.getComputedStyle(el);
+    return s.display !== 'none' && s.visibility !== 'hidden' &&
+           parseFloat(s.opacity || '1') > 0.01;
+  }
+  function _hasVisibleLink(el) {
+    var as = el.querySelectorAll('a[href^="http"]');
+    for (var i = 0; i < as.length; i++) { if (_visible(as[i])) { return true; } }
+    return false;
+  }
+  function _isSponsoredLabel(el) {
+    return el.children.length === 0 && _trim(el.textContent) === 'Sponsored' &&
+           _visible(el);
+  }
+  function _findSponsored() {
+    var regions = [];
+    // Only keep VISIBLE blocks that actually hold a visible link — Google ships
+    // hidden ad-template/placeholder nodes that would otherwise false-positive.
+    function add(el) {
+      if (!el || !_visible(el) || !_hasVisibleLink(el)) { return; }
+      for (var i = 0; i < regions.length; i++) {
+        if (regions[i] === el || regions[i].contains(el)) { return; }
+      }
+      regions = regions.filter(function (r) { return !el.contains(r); });
+      regions.push(el);
+    }
+    ['#tads', '#tadsb', '#bottomads'].forEach(function (sel) {
+      document.querySelectorAll(sel).forEach(function (el) { add(el); });
+    });
+    document.querySelectorAll('[data-text-ad]').forEach(function (el) { add(el); });
+    // Every visible "Sponsored" label -> climb to the ad card that holds it.
+    var nodes = document.querySelectorAll('span, div');
+    for (var i = 0; i < nodes.length; i++) {
+      if (!_isSponsoredLabel(nodes[i])) { continue; }
+      var block = nodes[i], chosen = null;
+      for (var k = 0; k < 8 && block.parentElement; k++) {
+        block = block.parentElement;
+        if (_hasVisibleLink(block)) {
+          chosen = block;
+          // Stop once the block also carries the title/description text.
+          if (_trim(block.textContent).length > 40) { break; }
+        }
+      }
+      add(chosen);
+    }
+    return regions;
+  }
+"""
+
+SPONSORED_PRESENT_JS = ("return (function () {\n" + _FIND_SPONSORED_JS +
+                        "\n  return _findSponsored().length > 0;\n})();")
+
+# Visually isolate the sponsored result(s): hide every node EXCEPT the ad
+# block(s) and the chain of ancestors that hold them. Google's own markup and
+# stylesheets stay in place, so each ad keeps its native styling. Returns how
+# many ad blocks were kept.
+STRIP_TO_SPONSORED_JS = ("return (function () {\n" + _FIND_SPONSORED_JS + r"""
+  var regions = _findSponsored();
+  if (!regions.length) { return 0; }
+
+  // Keep the ancestor chain of every ad block (so layout/positioning CSS that
+  // relies on those containers still applies).
+  var keep = new Set();
+  regions.forEach(function (r) {
+    var n = r;
+    while (n && n !== document.documentElement) { keep.add(n); n = n.parentElement; }
+  });
+  function insideRegion(el) {
+    for (var i = 0; i < regions.length; i++) {
+      if (regions[i].contains(el)) { return true; }
+    }
+    return false;
+  }
+  // Hide anything that is neither on a kept ancestor chain nor part of an ad.
+  var all = document.body.querySelectorAll('*');
+  for (var j = 0; j < all.length; j++) {
+    var node = all[j];
+    if (keep.has(node) || insideRegion(node)) { continue; }
+    node.style.setProperty('display', 'none', 'important');
+  }
+  // Nudge each kept block so the hover overlay box never covers the ad.
+  regions.forEach(function (r) {
+    r.style.setProperty('scroll-margin-top', '80px');
+  });
+  window.scrollTo(0, 0);
+  return regions.length;
+})();""")
+
+
+# Helpers to derive a result's *destination domain*. Organic results carry the
+# real host directly; ads ride on google.com/aclk or googleadservices.com
+# redirects, so we dig the advertiser domain out of the aclk "adurl" param, and
+# fall back to the ad's visible display URL (e.g. "example.com"). Matching is by
+# domain, NOT exact URL — ad URLs carry a fresh token on every page load.
+_DOMAIN_HELPERS_JS = r"""
+  function _reg(h) { return (h || '').toLowerCase().replace(/^www\./, ''); }
+  function _hostDomain(href) {
+    try { return _reg(new URL(href).hostname); } catch (e) { return ''; }
+  }
+  function _isAdHost(href) {
+    var h = _hostDomain(href);
+    return /(^|\.)googleadservices\.com$/.test(h) ||
+           (/(^|\.)google\.[a-z.]+$/.test(h) && /\/aclk/i.test(href));
+  }
+  function _adUrlDomain(href) {
+    try {
+      var u = new URL(href), keys = ['adurl', 'url', 'durl', 'q', 'dest'];
+      for (var i = 0; i < keys.length; i++) {
+        var v = u.searchParams.get(keys[i]);
+        if (v && /^https?:/i.test(v)) { return _hostDomain(v); }
+      }
+    } catch (e) {}
+    return '';
+  }
+  function _looksDomain(t) {
+    var s = (t || '').replace(/\s+/g, ' ').trim();
+    var m = s.match(/[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9-]+)+/i);
+    if (!m) { return ''; }
+    var d = _reg(m[0]);
+    if (d.indexOf('google') !== -1 || d.indexOf('gstatic') !== -1) { return ''; }
+    return d;
+  }
+  function _displayDomain(block) {
+    if (!block) { return ''; }
+    var cite = block.querySelector('cite');
+    if (cite) { var c = _looksDomain(cite.textContent); if (c) { return c; } }
+    var els = block.querySelectorAll('span, cite, div');
+    for (var i = 0; i < els.length; i++) {
+      if (els[i].children.length) { continue; }
+      var d = _looksDomain(els[i].textContent);
+      if (d) { return d; }
+    }
+    return '';
+  }
+  function _destDomain(anchor, block) {
+    var href = anchor ? anchor.href : '';
+    if (href && !_isAdHost(href)) { return _hostDomain(href); }
+    var d = _adUrlDomain(href);
+    if (d) { return d; }
+    return _displayDomain(block);
+  }
+  function _domainMatch(a, b) {
+    if (!a || !b) { return false; }
+    if (a === b) { return true; }
+    return a.endsWith('.' + b) || b.endsWith('.' + a);
+  }
+"""
+
+# Resolve the destination domain of the locked target (arguments[0] = its href).
+LOCK_DOMAIN_JS = ("return (function (href) {\n" + _DOMAIN_HELPERS_JS +
+                  _FIND_SPONSORED_JS + r"""
+  var as = document.querySelectorAll('a[href]'), anchor = null;
+  for (var i = 0; i < as.length; i++) {
+    if (as[i].href === href) { anchor = as[i]; break; }
+  }
+  var block = null, regions = _findSponsored();
+  for (var r = 0; r < regions.length; r++) {
+    if (anchor && regions[r].contains(anchor)) { block = regions[r]; break; }
+  }
+  if (!block && anchor) { block = anchor.closest('div') || anchor.parentElement; }
+  return _destDomain(anchor, block) || _hostDomain(href);
+})(arguments[0]);""")
+
+# Click the first result (ad or organic) whose destination domain matches the
+# target (arguments[0]). Returns {status: clicked|absent, ...}.
+CLICK_BY_DOMAIN_JS = ("return (function (target) {\n" + _DOMAIN_HELPERS_JS +
+                      _FIND_SPONSORED_JS + r"""
+  function _titleAnchor(block) {
+    var h = block.querySelector('h3, [role="heading"]');
+    if (h) { var a = h.closest('a'); if (a && /^http/.test(a.href)) { return a; } }
+    var as = block.querySelectorAll('a[href^="http"]');
+    for (var i = 0; i < as.length; i++) {
+      var lbl = (as[i].getAttribute('aria-label') || '') + ' ' +
+                (as[i].textContent || '');
+      if (/why this ad|ad settings|about this/i.test(lbl)) { continue; }
+      return as[i];
+    }
+    return as[0] || null;
+  }
+  var cands = [];
+  _findSponsored().forEach(function (block) {
+    var a = _titleAnchor(block);
+    if (a) { cands.push({ a: a, block: block, ad: true }); }
+  });
+  var h3 = document.querySelectorAll('#search h3, #rso h3');
+  for (var i = 0; i < h3.length; i++) {
+    var a = h3[i].closest('a');
+    if (a && a.href && a.href.indexOf('http') === 0) {
+      cands.push({ a: a, block: a.closest('div'), ad: false });
+    }
+  }
+  var total = cands.length;
+  for (var j = 0; j < total; j++) {
+    var dom = _destDomain(cands[j].a, cands[j].block);
+    if (_domainMatch(dom, target)) {
+      var el = cands[j].a;
+      el.target = '_self';        // navigate this tab, don't spawn one
+      el.scrollIntoView({ block: 'center' });
+      el.click();
+      return { status: 'clicked', index: j, total: total,
+               href: el.href, domain: dom, ad: cands[j].ad };
+    }
+  }
+  return { status: 'absent', total: total };
+})(arguments[0]);""")
+
+
+def _target_domain(driver, href: str) -> str:
+    """Destination domain of the locked target (advertiser domain for ads)."""
+    try:
+        return driver.execute_script(LOCK_DOMAIN_JS, href) or ""
+    except WebDriverException:
+        return ""
+
+
+def _sponsored_present(driver) -> bool:
+    """True if the current results page shows at least one sponsored result."""
+    try:
+        return bool(driver.execute_script(SPONSORED_PRESENT_JS))
+    except WebDriverException:
+        return False
+
+
+def _wait_for_sponsored(driver, logger, keyword: str,
+                        interval: float = 5.0, max_refreshes: int = 5) -> bool:
+    """Return True as soon as a sponsored result is present. If none yet, refresh
+    every *interval* seconds up to *max_refreshes* times, re-checking after each.
+    Return False if still none. Lets WebDriverException propagate so a closed
+    browser is handled by the caller."""
+    if _sponsored_present(driver):
+        return True
+    for attempt in range(1, max_refreshes + 1):
+        time.sleep(interval)
+        driver.refresh()      # may raise WebDriverException -> caller exits
+        try:
+            WebDriverWait(driver, 15).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "div#search")))
+        except (TimeoutException, WebDriverException):
+            pass
+        print(f"    no sponsored result — refresh {attempt}/{max_refreshes}")
+        logger.log("kw_refresh", keyword=keyword,
+                   detail=f"{attempt}/{max_refreshes}")
+        if _sponsored_present(driver):
+            return True
+    return False
+
+
+def _strip_to_sponsored(driver) -> int:
+    """Strip the page down to only its sponsored result(s). Returns the count."""
+    try:
+        return int(driver.execute_script(STRIP_TO_SPONSORED_JS) or 0)
+    except WebDriverException:
+        return 0
+
+
+def run_keyword_mode(keyword: str | None, delay: float, log_path: str,
+                     prompt_keyword=None) -> int:
     """Lock a target result for *keyword*, then repeatedly search page 1 and
     click that target wherever it ranks on page 1, waiting for full load before
     closing, until the user presses Stop. *delay* is the pause between searches
@@ -581,106 +803,158 @@ def run_keyword_mode(keyword: str | None, delay: float, log_path: str) -> int:
     if not keyword:
         print("[!] Keyword mode needs a keyword.")
         return 1
-    driver = build_driver()
     logger = CsvLogger(log_path)
     print(f"[+] Logging to {os.path.abspath(log_path)}")
     logger.log("kw_session_start", keyword=keyword, detail=f"delay={delay}s")
+    driver = None
     try:
-        driver.get("https://www.google.com/ncr")
-        dismiss_consent(driver)
-        google_tab = driver.current_window_handle
-        print(f"[*] Searching for: {keyword!r}")
-        logger.log("search", keyword=keyword)
-        do_search(driver, keyword)
-        driver.execute_script(OVERLAY_JS, 1, "✓ Use this link")
-        print("[*] Refine the search if you like. When you see the result you "
-              "want, hover it and click the blue '✓ Use this link' box.")
+        # Outer loop: one full attempt per keyword. A keyword whose page never
+        # shows a sponsored result is dropped and we ask for another one.
+        while keyword:
+            driver = build_driver()
+            try:
+                driver.get("https://www.google.com/ncr")
+                dismiss_consent(driver)
+                google_tab = driver.current_window_handle
+                print(f"[*] Searching for: {keyword!r}")
+                logger.log("search", keyword=keyword)
+                do_search(driver, keyword)
 
-        # Phase 1: let the user browse/re-search until they lock a target.
-        target = None
-        while target is None:
-            try:
-                if not driver.execute_script("return !!window.__clickerInstalled"):
-                    driver.execute_script(OVERLAY_JS, 1, "✓ Use this link")
-                href = driver.execute_script("return window.__selectedHref")
-                if href:
-                    driver.execute_script("window.__selectedHref = null;")
-                    target = href
-            except WebDriverException:
-                print("[*] Browser closed — exiting.")
-                logger.log("browser_closed")
-                return 0
-            time.sleep(0.4)
+                # Require a sponsored result. If none, refresh every 5s up to 5
+                # times; if still none, drop this keyword and ask for another.
+                if not _wait_for_sponsored(driver, logger, keyword):
+                    print("[*] No sponsored result after 5 refreshes — "
+                          "closing Chrome.")
+                    logger.log("kw_no_sponsored", keyword=keyword)
+                    try:
+                        driver.quit()
+                    except WebDriverException:
+                        pass
+                    driver = None
+                    if prompt_keyword is None:
+                        print("[*] No way to ask for a keyword — exiting.")
+                        return 0
+                    nxt = prompt_keyword(keyword)
+                    if not nxt:
+                        print("[*] No keyword entered — exiting.")
+                        return 0
+                    keyword = nxt
+                    logger.log("kw_retry", keyword=keyword)
+                    continue
 
-        print(f"[*] Target locked: {target}")
-        logger.log("kw_target", keyword=keyword, url=target)
+                # Sponsored result(s) present: strip the page down to only them.
+                kept = _strip_to_sponsored(driver)
+                print(f"[*] Sponsored result(s) found — kept {kept}, removed the "
+                      "rest of the page.")
+                logger.log("kw_sponsored", keyword=keyword, total=kept)
 
-        # Phase 2: search-check-click loop until Stop.
-        try:
-            driver.execute_script("window.__beginRun && window.__beginRun();")
-        except WebDriverException:
-            pass
-        clicks = [0]
-        it = 0
-        last_ua = None
-        while True:
-            if _stop_requested(driver):
-                break
-            it += 1
-            try:
-                driver.execute_script(
-                    "window.__setBadge && window.__setBadge(arguments[0]);",
-                    f"Search {it} • {clicks[0]} clicks")
-            except WebDriverException:
-                print("[*] Browser closed — exiting.")
-                logger.log("browser_closed")
-                return 0
-            ua = pick_user_agent(last_ua)
-            last_ua = ua
-            try:
-                keyword_search_once(driver, google_tab, keyword, target,
-                                    logger, it, clicks, ua, first=(it == 1))
-            except WebDriverException:
-                print("[*] Browser closed — exiting.")
-                logger.log("browser_closed")
-                return 0
-            try:
-                driver.execute_script(
-                    "window.__setBadge && window.__setBadge(arguments[0]);",
-                    f"Search {it} done • {clicks[0]} clicks")
-            except WebDriverException:
-                break
-            # Optional pause between searches (default 0 = no delay).
-            if delay > 0 and not _stop_requested(driver):
-                waited = 0.0
-                while waited < delay:
+                driver.execute_script(OVERLAY_JS, 1, "✓ Use this link")
+                print("[*] Hover a sponsored result and click the blue "
+                      "'✓ Use this link' box to lock it.")
+
+                # Phase 1: let the user lock a target.
+                target = None
+                while target is None:
+                    try:
+                        if not driver.execute_script(
+                                "return !!window.__clickerInstalled"):
+                            driver.execute_script(OVERLAY_JS, 1, "✓ Use this link")
+                        href = driver.execute_script("return window.__selectedHref")
+                        if href:
+                            driver.execute_script("window.__selectedHref = null;")
+                            target = href
+                    except WebDriverException:
+                        print("[*] Browser closed — exiting.")
+                        logger.log("browser_closed")
+                        return 0
+                    time.sleep(0.4)
+
+                target_domain = _target_domain(driver, target)
+                if not target_domain:
+                    print("[!] Could not read the target's domain — using the "
+                          "raw link.")
+                print(f"[*] Target locked: {target}")
+                print(f"[*] Will click results on domain: "
+                      f"{target_domain or '(unknown)'}")
+                logger.log("kw_target", keyword=keyword, url=target,
+                           detail=f"domain={target_domain}")
+
+                # Phase 2: search-check-click loop until Stop.
+                try:
+                    driver.execute_script(
+                        "window.__beginRun && window.__beginRun();")
+                except WebDriverException:
+                    pass
+                clicks = [0]
+                it = 0
+                last_ua = None
+                while True:
                     if _stop_requested(driver):
                         break
-                    time.sleep(0.2)
-                    waited += 0.2
+                    it += 1
+                    try:
+                        driver.execute_script(
+                            "window.__setBadge && window.__setBadge(arguments[0]);",
+                            f"Search {it} • {clicks[0]} clicks")
+                    except WebDriverException:
+                        print("[*] Browser closed — exiting.")
+                        logger.log("browser_closed")
+                        return 0
+                    ua = pick_user_agent(last_ua)
+                    last_ua = ua
+                    try:
+                        keyword_search_once(driver, google_tab, keyword,
+                                            target_domain, logger, it, clicks,
+                                            ua, first=(it == 1))
+                    except WebDriverException:
+                        print("[*] Browser closed — exiting.")
+                        logger.log("browser_closed")
+                        return 0
+                    try:
+                        driver.execute_script(
+                            "window.__setBadge && window.__setBadge(arguments[0]);",
+                            f"Search {it} done • {clicks[0]} clicks")
+                    except WebDriverException:
+                        break
+                    # Optional pause between searches (default 0 = no delay).
+                    if delay > 0 and not _stop_requested(driver):
+                        waited = 0.0
+                        while waited < delay:
+                            if _stop_requested(driver):
+                                break
+                            time.sleep(0.2)
+                            waited += 0.2
 
-        print(f"[*] Stopped after {it} search(es), {clicks[0]} clicks.")
-        logger.log("kw_stopped", keyword=keyword, click=clicks[0], total=it)
-        try:
-            driver.execute_script("window.__hideProgress && window.__hideProgress();")
-        except WebDriverException:
-            pass
-        # Keep the window open until the user closes it.
-        print("[+] Done. Close the browser window to finish.")
-        while True:
-            try:
-                driver.execute_script("return 1")
+                print(f"[*] Stopped after {it} search(es), {clicks[0]} clicks.")
+                logger.log("kw_stopped", keyword=keyword, click=clicks[0],
+                           total=it)
+                try:
+                    driver.execute_script(
+                        "window.__hideProgress && window.__hideProgress();")
+                except WebDriverException:
+                    pass
+                # Keep the window open until the user closes it.
+                print("[+] Done. Close the browser window to finish.")
+                while True:
+                    try:
+                        driver.execute_script("return 1")
+                    except WebDriverException:
+                        break
+                    time.sleep(0.5)
+                return 0
             except WebDriverException:
-                break
-            time.sleep(0.5)
+                print("[*] Browser closed — exiting.")
+                logger.log("browser_closed")
+                return 0
         return 0
     finally:
         logger.log("kw_session_end")
         logger.close()
-        try:
-            driver.quit()
-        except WebDriverException:
-            pass
+        if driver is not None:
+            try:
+                driver.quit()
+            except WebDriverException:
+                pass
 
 
 CONFIG_FILE = "clicker_config.json"
@@ -763,6 +1037,68 @@ def settings_menu(cfg: dict) -> None:
             print("  [!] Pick 1-6.")
 
 
+# Columns shown in the spreadsheet-style log view: (display title, CSV field).
+LOG_COLUMNS = [
+    ("Time", "timestamp"),
+    ("Event", "event"),
+    ("Keyword", "keyword"),
+    ("Click", "click"),
+    ("Total", "total"),
+    ("URL / Target", "url"),
+    ("User agent", "user_agent"),
+    ("Detail", "detail"),
+]
+
+
+def read_log_table(log_path: str, tail: int = 200):
+    """Return (headers, rows) for a table view of the last *tail* log entries.
+    Each row is a list of cell strings aligned to LOG_COLUMNS."""
+    headers = [title for title, _ in LOG_COLUMNS]
+    if not os.path.exists(log_path):
+        return headers, []
+    try:
+        with open(log_path, encoding="utf-8") as fh:
+            raw = list(csv.reader(fh))
+    except OSError:
+        return headers, []
+    if len(raw) <= 1:
+        return headers, []
+    csv_header, data = raw[0], raw[1:]
+    idx = {name: i for i, name in enumerate(csv_header)}
+
+    def cell(row, name):
+        i = idx.get(name)
+        return row[i] if i is not None and i < len(row) else ""
+
+    def target_of(row):
+        """Always return a URL or target for the row: the logged URL, else the
+        domain embedded in the detail field, else the keyword."""
+        url = cell(row, "url")
+        if url:
+            return url
+        detail = cell(row, "detail")
+        if detail.startswith("domain="):
+            return detail[len("domain="):]
+        if ":" in detail:                    # e.g. "iter3:example.com"
+            tail = detail.split(":", 1)[1]
+            if "." in tail:
+                return tail
+        return cell(row, "keyword") or "—"   # never leave the cell blank
+
+    rows = []
+    for r in data[-tail:]:
+        values = []
+        for _title, key in LOG_COLUMNS:
+            if key == "url":
+                values.append(target_of(r))
+            elif key == "timestamp":
+                values.append(cell(r, key)[11:19] or cell(r, key))
+            else:
+                values.append(cell(r, key))
+        rows.append(values)
+    return headers, rows
+
+
 def format_logs(log_path: str, tail: int = 50) -> str:
     """Return a compact text view of the last *tail* log entries."""
     if not os.path.exists(log_path):
@@ -826,8 +1162,16 @@ def terminal_menu(cfg: dict) -> int:
             kw = cfg["keyword"] or input("  Keyword: ").strip()
             if kw:
                 cfg["keyword"] = kw
+
+                def ask_again(current):
+                    nxt = input("  No sponsored result. New keyword "
+                                "(blank to stop): ").strip()
+                    if nxt:
+                        cfg["keyword"] = nxt
+                    return nxt or None
+
                 try:
-                    run_keyword_mode(kw, cfg["kw_delay"], cfg["log"])
+                    run_keyword_mode(kw, cfg["kw_delay"], cfg["log"], ask_again)
                 except KeyboardInterrupt:
                     print("\n[*] Interrupted — back to menu.")
             else:
@@ -846,7 +1190,7 @@ def terminal_menu(cfg: dict) -> int:
 def launch_gui(cfg: dict) -> int:
     """Native desktop launcher: Open Chrome / Logs / Settings / Exit."""
     import tkinter as tk
-    from tkinter import messagebox, scrolledtext, simpledialog
+    from tkinter import messagebox, simpledialog, ttk
 
     session = {"active": False}
 
@@ -919,23 +1263,89 @@ def launch_gui(cfg: dict) -> int:
             return
         kw = kw.strip()
         cfg["keyword"] = kw
+
+        def ask_again(current):
+            """Called from the worker thread when a keyword shows no sponsored
+            result. Marshals the prompt onto the Tk main thread and blocks until
+            the user answers. Returns the new keyword, or None to stop."""
+            holder = {}
+            done = threading.Event()
+
+            def show():
+                holder["v"] = simpledialog.askstring(
+                    "No sponsored result",
+                    "No sponsored result for that keyword.\n"
+                    "Enter another keyword (Cancel to stop):",
+                    initialvalue=current, parent=root)
+                done.set()
+
+            root.after(0, show)
+            done.wait()
+            val = holder.get("v")
+            val = val.strip() if val else ""
+            if val:
+                cfg["keyword"] = val
+            return val or None
+
         _run_session(
-            lambda: run_keyword_mode(kw, cfg["kw_delay"], cfg["log"]),
+            lambda: run_keyword_mode(kw, cfg["kw_delay"], cfg["log"], ask_again),
             "Keyword auto-click running… (press ■ Stop in the browser)")
 
     def view_logs():
         win = tk.Toplevel(root)
         win.title("Logs")
-        win.geometry("760x460")
-        st = scrolledtext.ScrolledText(win, font=("Courier New", 10),
-                                       wrap="none")
-        st.pack(fill="both", expand=True)
-        st.insert("1.0", format_logs(cfg["log"], tail=200))
-        st.config(state="disabled")
-        tk.Button(win, text="Refresh", command=lambda: (
-            st.config(state="normal"), st.delete("1.0", "end"),
-            st.insert("1.0", format_logs(cfg["log"], tail=200)),
-            st.config(state="disabled"))).pack(pady=4)
+        win.geometry("1000x540")
+
+        style = ttk.Style(win)
+        try:
+            style.theme_use("clam")          # draws clean cell/grid borders
+        except tk.TclError:
+            pass
+        style.configure("Logs.Treeview", rowheight=24, font=("Arial", 10),
+                        borderwidth=1, relief="solid", fieldbackground="#ffffff")
+        style.configure("Logs.Treeview.Heading", font=("Arial", 10, "bold"),
+                        background="#d7dde5", relief="raised")
+
+        frame = tk.Frame(win)
+        frame.pack(fill="both", expand=True, padx=8, pady=(8, 0))
+
+        headers = [title for title, _ in LOG_COLUMNS]
+        widths = {"Time": 74, "Event": 120, "Keyword": 170, "Click": 54,
+                  "Total": 54, "URL / Target": 300, "User agent": 230,
+                  "Detail": 180}
+        centered = {"Click", "Total"}
+        tree = ttk.Treeview(frame, columns=headers, show="headings",
+                            style="Logs.Treeview")
+        for h in headers:
+            tree.heading(h, text=h)
+            tree.column(h, width=widths.get(h, 120), minwidth=40,
+                        anchor="center" if h in centered else "w",
+                        stretch=False)
+
+        ysb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        xsb = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        ysb.grid(row=0, column=1, sticky="ns")
+        xsb.grid(row=1, column=0, sticky="ew")
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+
+        tree.tag_configure("odd", background="#ffffff")
+        tree.tag_configure("even", background="#eef2f7")   # Excel-style banding
+
+        def reload():
+            tree.delete(*tree.get_children())
+            _, rows = read_log_table(cfg["log"])
+            for i, vals in enumerate(rows):
+                tree.insert("", "end", values=vals,
+                            tags=("even" if i % 2 else "odd",))
+            kids = tree.get_children()
+            if kids:
+                tree.see(kids[-1])           # jump to the latest entry
+
+        reload()
+        tk.Button(win, text="Refresh", command=reload).pack(pady=6)
 
     def open_settings():
         win = tk.Toplevel(root)
@@ -993,6 +1403,10 @@ def launch_gui(cfg: dict) -> int:
 
 
 def main() -> int:
+    try:                       # flush prints promptly so log files stay current
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError):
+        pass
     parser = argparse.ArgumentParser(
         description="Interactive Google result clicker (hover -> click box -> "
                     "open link N times).",
