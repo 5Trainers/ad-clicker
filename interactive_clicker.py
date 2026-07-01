@@ -334,7 +334,7 @@ def do_search(driver, keyword: str) -> None:
     box.send_keys(keyword)
     box.submit()
     WebDriverWait(driver, 15).until(
-        EC.presence_of_element_located((By.CSS_SELECTOR, "div#search"))
+        EC.presence_of_element_located((By.CSS_SELECTOR, "div#search, div#rso"))
     )
     dismiss_consent(driver)
 
@@ -440,7 +440,7 @@ def run(keyword: str | None, times: int, delay: float, log_path: str,
             print("[*] Google is open — type your search in the browser window.")
             # Wait until a results page exists.
             WebDriverWait(driver, 300).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "div#search"))
+                EC.presence_of_element_located((By.CSS_SELECTOR, "div#search, div#rso"))
             )
 
         driver.execute_script(OVERLAY_JS, times)
@@ -521,7 +521,7 @@ def keyword_search_once(driver, google_tab: str, keyword: str,
     # Wait for page-1 results before scanning for the target domain.
     try:
         WebDriverWait(driver, 15).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "div#search")))
+            EC.presence_of_element_located((By.CSS_SELECTOR, "div#search, div#rso")))
     except (TimeoutException, WebDriverException):
         pass
     if first:
@@ -805,7 +805,7 @@ def _wait_for_sponsored(driver, logger, keyword: str,
         driver.refresh()      # may raise WebDriverException -> caller exits
         try:
             WebDriverWait(driver, 15).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "div#search")))
+                EC.presence_of_element_located((By.CSS_SELECTOR, "div#search, div#rso")))
         except (TimeoutException, WebDriverException):
             pass
         print(f"    no sponsored result — refresh {attempt}/{max_refreshes}")
