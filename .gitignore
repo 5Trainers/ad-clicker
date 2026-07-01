@@ -4,6 +4,11 @@ __pycache__/
 venv/
 .venv/
 
+# PyInstaller build artifacts
+build/
+dist/
+build-venv/
+
 # App runtime artifacts
 click_log.csv
 clicker_config.json

@@ -278,10 +278,25 @@ def build_driver() -> webdriver.Chrome:
     options.add_argument(f"--user-data-dir={tempfile.mkdtemp(prefix='clicker-chrome-')}")
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
-    service = Service(ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=service, options=options)
-    driver.set_page_load_timeout(30)
-    return driver
+
+    # Resolve chromedriver automatically. Selenium 4.6+ ships "Selenium Manager",
+    # which finds/downloads a matching driver on its own and works when frozen
+    # into a .exe with no Python installed. We try it first, then fall back to
+    # webdriver-manager if Selenium Manager can't reach the network.
+    last_err = None
+    for attempt in ("selenium-manager", "webdriver-manager"):
+        try:
+            if attempt == "selenium-manager":
+                driver = webdriver.Chrome(options=options)
+            else:
+                service = Service(ChromeDriverManager().install())
+                driver = webdriver.Chrome(service=service, options=options)
+            driver.set_page_load_timeout(30)
+            return driver
+        except WebDriverException as exc:
+            last_err = exc
+            continue
+    raise last_err
 
 
 def dismiss_consent(driver) -> None:

@@ -46,6 +46,26 @@ python interactive_clicker.py
 Run it with a **visible** browser (no headless) — you drive it by hand. Close
 the browser window to quit.
 
+## Build a standalone Windows .exe (no Python needed to run)
+
+You can package everything into a single `GoogleResultClicker.exe` that runs on
+any Windows PC **without Python installed**.
+
+Building must be done **on a Windows machine** (PyInstaller can't cross-build
+from Linux/macOS). You only need Python for the build step — the finished `.exe`
+does not.
+
+1. Copy this project folder to a Windows PC that has
+   [Python 3](https://www.python.org/downloads/windows/) installed (tick
+   *"Add python.exe to PATH"* during setup).
+2. Double-click **`build.bat`** (or run it from a command prompt).
+3. When it finishes, your program is at **`dist\GoogleResultClicker.exe`**.
+
+Copy that single `.exe` anywhere and double-click to run it — no install, no
+Python, no `pip`. The only requirement on the target PC is **Google Chrome**
+(Selenium drives a real Chrome window; the matching driver is fetched
+automatically on first run).
+
 ## Notes & limitations
 
 - **Google discourages automated queries.** You may hit a consent page (handled
