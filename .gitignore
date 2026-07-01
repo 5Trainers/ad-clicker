@@ -12,9 +12,6 @@ build-venv/
 # Windows-installer build cache (downloaded Python / Inno Setup installers)
 .build-cache/
 
-# Inno Setup installer output
-installer-output/
-
 # App runtime artifacts
 click_log.csv
 clicker_config.json
