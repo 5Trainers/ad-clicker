@@ -9,6 +9,9 @@ build/
 dist/
 build-venv/
 
+# Inno Setup installer output
+installer-output/
+
 # App runtime artifacts
 click_log.csv
 clicker_config.json

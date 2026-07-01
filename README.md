@@ -46,25 +46,40 @@ python interactive_clicker.py
 Run it with a **visible** browser (no headless) — you drive it by hand. Close
 the browser window to quit.
 
-## Build a standalone Windows .exe (no Python needed to run)
+## Shareable Windows installer (recommended)
 
-You can package everything into a single `GoogleResultClicker.exe` that runs on
-any Windows PC **without Python installed**.
+For distribution, this project produces a single **`GoogleResultClicker-Setup.exe`**
+installer. You share that one file; the recipient double-clicks it, clicks through
+a normal install wizard, and gets a Start Menu (and optional Desktop) shortcut.
+**No Python, no `pip`, nothing to configure** — the only requirement on their PC is
+**Google Chrome**.
 
-Building must be done **on a Windows machine** (PyInstaller can't cross-build
-from Linux/macOS). You only need Python for the build step — the finished `.exe`
-does not.
+### Get the installer from the cloud (no Windows PC needed)
 
-1. Copy this project folder to a Windows PC that has
-   [Python 3](https://www.python.org/downloads/windows/) installed (tick
-   *"Add python.exe to PATH"* during setup).
-2. Double-click **`build.bat`** (or run it from a command prompt).
-3. When it finishes, your program is at **`dist\GoogleResultClicker.exe`**.
+The installer is built automatically by GitHub Actions on a Windows runner, so you
+don't need a Windows machine or Python installed anywhere:
 
-Copy that single `.exe` anywhere and double-click to run it — no install, no
-Python, no `pip`. The only requirement on the target PC is **Google Chrome**
-(Selenium drives a real Chrome window; the matching driver is fetched
-automatically on first run).
+- **Latest build:** open the repo's **Actions** tab → newest *Build Windows
+  Installer* run → download **`GoogleResultClicker-Setup`** from *Artifacts*.
+- **A shareable release:** tag a version and push it —
+
+  ```bash
+  git tag v1.0.0
+  git push origin v1.0.0
+  ```
+
+  A GitHub **Release** is created with `GoogleResultClicker-Setup.exe` attached as a
+  download you can hand to anyone.
+
+### Build the installer manually on a Windows PC (optional)
+
+If you'd rather build it yourself on Windows:
+
+1. Install [Python 3](https://www.python.org/downloads/windows/) (tick *"Add
+   python.exe to PATH"*) and [Inno Setup 6](https://jrsoftware.org/isdl.php).
+2. Double-click **`build.bat`** to produce `dist\GoogleResultClicker.exe`.
+3. Open **`installer.iss`** in Inno Setup and click **Compile**. The finished
+   installer lands in **`installer-output\GoogleResultClicker-Setup.exe`**.
 
 ## Notes & limitations
 
