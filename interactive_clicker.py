@@ -266,18 +266,32 @@ class CsvLogger:
             pass
 
 
-def build_driver() -> webdriver.Chrome:
+def build_driver(view: str = "desktop") -> webdriver.Chrome:
     options = Options()
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_argument("--window-size=1280,950")
     options.add_argument("--lang=en-US")
     # Use a dedicated, throwaway profile so we never collide with the user's
     # everyday Chrome (which locks the default profile).
     options.add_argument(f"--user-data-dir={tempfile.mkdtemp(prefix='clicker-chrome-')}")
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
+
+    if view == "mobile":
+        # Emulate a phone so Google serves its MOBILE search layout, where
+        # sponsored (ad) results show up more often and are easier to click.
+        # deviceMetrics + userAgent is more portable across chromedriver
+        # versions than a named "deviceName".
+        options.add_experimental_option("mobileEmulation", {
+            "deviceMetrics": {"width": 412, "height": 915, "pixelRatio": 2.625},
+            "userAgent": ("Mozilla/5.0 (Linux; Android 13; Pixel 7) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/120.0.0.0 Mobile Safari/537.36"),
+        })
+        options.add_argument("--window-size=420,915")
+    else:
+        options.add_argument("--window-size=1280,950")
 
     # Resolve chromedriver automatically. Selenium 4.6+ ships "Selenium Manager",
     # which finds/downloads a matching driver on its own and works when frozen
@@ -405,12 +419,13 @@ def click_link_n_times(driver, google_tab: str, url: str, times: int,
     return stopped
 
 
-def run(keyword: str | None, times: int, delay: float, log_path: str) -> int:
-    driver = build_driver()
+def run(keyword: str | None, times: int, delay: float, log_path: str,
+        view: str = "desktop") -> int:
+    driver = build_driver(view)
     logger = CsvLogger(log_path)
     print(f"[+] Logging to {os.path.abspath(log_path)}")
     logger.log("session_start", keyword=keyword or "",
-               total=times, detail=f"delay={delay}s")
+               total=times, detail=f"delay={delay}s view={view}")
     google_tab = None
     try:
         driver.get("https://www.google.com/ncr")
@@ -810,7 +825,7 @@ def _strip_to_sponsored(driver) -> int:
 
 
 def run_keyword_mode(keyword: str | None, delay: float, log_path: str,
-                     prompt_keyword=None) -> int:
+                     prompt_keyword=None, view: str = "desktop") -> int:
     """Lock a target result for *keyword*, then repeatedly search page 1 and
     click that target wherever it ranks on page 1, waiting for full load before
     closing, until the user presses Stop. *delay* is the pause between searches
@@ -820,13 +835,14 @@ def run_keyword_mode(keyword: str | None, delay: float, log_path: str,
         return 1
     logger = CsvLogger(log_path)
     print(f"[+] Logging to {os.path.abspath(log_path)}")
-    logger.log("kw_session_start", keyword=keyword, detail=f"delay={delay}s")
+    logger.log("kw_session_start", keyword=keyword,
+               detail=f"delay={delay}s view={view}")
     driver = None
     try:
         # Outer loop: one full attempt per keyword. A keyword whose page never
         # shows a sponsored result is dropped and we ask for another one.
         while keyword:
-            driver = build_driver()
+            driver = build_driver(view)
             try:
                 driver.get("https://www.google.com/ncr")
                 dismiss_consent(driver)
@@ -979,6 +995,7 @@ DEFAULT_CONFIG = {
     "kw_delay": 0.0,   # keyword mode: pause between searches (0 = no delay)
     "log": "click_log.csv",
     "keyword": "",     # blank = type the search by hand in the browser
+    "view": "mobile",  # "mobile" = phone emulation (more ads), or "desktop"
 }
 
 
@@ -1151,6 +1168,22 @@ def show_logs(log_path: str, tail: int = 25) -> None:
         print(f"  {line}")
 
 
+def _ask_view(cfg: dict) -> str:
+    """Prompt Mobile / Desktop, defaulting to the saved choice. Persists it."""
+    default = cfg.get("view", "mobile")
+    raw = input(f"  View - [M]obile / [D]esktop [{default}]: ").strip().lower()
+    if raw.startswith("m"):
+        view = "mobile"
+    elif raw.startswith("d"):
+        view = "desktop"
+    else:
+        view = default
+    if view != cfg.get("view"):
+        cfg["view"] = view
+        save_config(CONFIG_FILE, cfg)
+    return view
+
+
 def terminal_menu(cfg: dict) -> int:
     """Text-based fallback menu (used when tkinter is unavailable)."""
     while True:
@@ -1168,15 +1201,17 @@ def terminal_menu(cfg: dict) -> int:
             print("\n[*] Bye.")
             return 0
         if choice == "1":
+            view = _ask_view(cfg)
             try:
                 run(cfg["keyword"] or None, cfg["times"], cfg["delay"],
-                    cfg["log"])
+                    cfg["log"], view=view)
             except KeyboardInterrupt:
                 print("\n[*] Interrupted — back to menu.")
         elif choice == "2":
             kw = cfg["keyword"] or input("  Keyword: ").strip()
             if kw:
                 cfg["keyword"] = kw
+                view = _ask_view(cfg)
 
                 def ask_again(current):
                     nxt = input("  No sponsored result. New keyword "
@@ -1186,7 +1221,8 @@ def terminal_menu(cfg: dict) -> int:
                     return nxt or None
 
                 try:
-                    run_keyword_mode(kw, cfg["kw_delay"], cfg["log"], ask_again)
+                    run_keyword_mode(kw, cfg["kw_delay"], cfg["log"], ask_again,
+                                     view=view)
                 except KeyboardInterrupt:
                     print("\n[*] Interrupted — back to menu.")
             else:
@@ -1221,7 +1257,25 @@ def launch_gui(cfg: dict) -> int:
              fg="#9ca3af", bg="#1f2937").pack(pady=(0, 6))
     status = tk.StringVar(value="Ready.")
     tk.Label(root, textvariable=status, font=("Arial", 10, "italic"),
-             fg="#34d399", bg="#1f2937").pack(pady=(0, 14))
+             fg="#34d399", bg="#1f2937").pack(pady=(0, 8))
+
+    # --- View selector: Mobile (default, more ads) or Desktop ---------------
+    view_var = tk.StringVar(value=cfg.get("view", "mobile"))
+
+    def on_view_change():
+        cfg["view"] = view_var.get()
+        save_config(CONFIG_FILE, cfg)
+
+    view_row = tk.Frame(root, bg="#1f2937")
+    view_row.pack(pady=(0, 12))
+    tk.Label(view_row, text="View:", font=("Arial", 10, "bold"),
+             fg="#e5e7eb", bg="#1f2937").pack(side="left", padx=(0, 8))
+    for text, val in (("📱 Mobile", "mobile"), ("💻 Desktop", "desktop")):
+        tk.Radiobutton(view_row, text=text, value=val, variable=view_var,
+                       command=on_view_change, font=("Arial", 10),
+                       fg="#e5e7eb", bg="#1f2937", selectcolor="#374151",
+                       activebackground="#1f2937", activeforeground="#ffffff",
+                       highlightthickness=0).pack(side="left", padx=4)
 
     def refresh_summary():
         summary.set(f"clicks={cfg['times']}   delay={cfg['delay']}s   "
@@ -1261,10 +1315,11 @@ def launch_gui(cfg: dict) -> int:
         threading.Thread(target=worker, daemon=True).start()
 
     def open_chrome():
+        view = view_var.get()
         _run_session(
             lambda: run(cfg["keyword"] or None, cfg["times"], cfg["delay"],
-                        cfg["log"]),
-            "Chrome session running… (close the browser to return)")
+                        cfg["log"], view=view),
+            f"Chrome ({view}) running… (close the browser to return)")
 
     def open_chrome_keyword():
         if session["active"]:
@@ -1302,9 +1357,11 @@ def launch_gui(cfg: dict) -> int:
                 cfg["keyword"] = val
             return val or None
 
+        view = view_var.get()
         _run_session(
-            lambda: run_keyword_mode(kw, cfg["kw_delay"], cfg["log"], ask_again),
-            "Keyword auto-click running… (press ■ Stop in the browser)")
+            lambda: run_keyword_mode(kw, cfg["kw_delay"], cfg["log"], ask_again,
+                                     view=view),
+            f"Keyword auto-click ({view}) running… (press ■ Stop in browser)")
 
     def view_logs():
         win = tk.Toplevel(root)
@@ -1438,6 +1495,8 @@ def main() -> int:
                         help="Skip the menu and start Chrome immediately.")
     parser.add_argument("--cli", action="store_true",
                         help="Force the text menu instead of the GUI window.")
+    parser.add_argument("--view", choices=("mobile", "desktop"), default=None,
+                        help="Chrome view: mobile (phone emulation) or desktop.")
     args = parser.parse_args()
 
     cfg = load_config(CONFIG_FILE)
@@ -1450,9 +1509,12 @@ def main() -> int:
         cfg["delay"] = args.delay
     if args.log is not None:
         cfg["log"] = args.log
+    if args.view is not None:
+        cfg["view"] = args.view
 
     if args.no_menu:
-        return run(cfg["keyword"] or None, cfg["times"], cfg["delay"], cfg["log"])
+        return run(cfg["keyword"] or None, cfg["times"], cfg["delay"],
+                   cfg["log"], view=cfg["view"])
 
     if not args.cli:
         try:
