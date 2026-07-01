@@ -7,11 +7,9 @@
 ;  Menu / Desktop shortcut. No Python, no dependencies, nothing to configure.
 ;  (The target PC only needs Google Chrome installed.)
 ;
-;  You normally do NOT run this by hand — the GitHub Actions workflow
-;  (.github/workflows/build-installer.yml) compiles it in the cloud. To build
-;  it manually on a Windows PC: install Inno Setup 6, run build.bat first to
-;  produce dist\GoogleResultClicker.exe, then open this file in Inno Setup and
-;  click Compile.
+;  You normally do NOT run this by hand — build_installer.sh compiles it for
+;  you (via Wine on Linux, or run ISCC.exe on it directly on a Windows PC after
+;  producing dist\GoogleResultClicker.exe with PyInstaller).
 ; ============================================================================
 
 #define MyAppName "Google Result Clicker"

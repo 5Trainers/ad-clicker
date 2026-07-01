@@ -1,5 +1,5 @@
 # PyInstaller spec for interactive_clicker.py -> a single Windows .exe.
-# Build with:  build.bat   (or manually:  pyinstaller clicker.spec)
+# Built by build_installer.sh (or manually:  pyinstaller clicker.spec)
 #
 # The resulting dist\GoogleResultClicker.exe bundles Python, Selenium, tkinter,
 # and everything else. The target PC needs NO Python. It DOES need Google Chrome

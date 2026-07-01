@@ -54,30 +54,31 @@ a normal install wizard, and gets a Start Menu (and optional Desktop) shortcut.
 **No Python, no `pip`, nothing to configure** — the only requirement on their PC is
 **Google Chrome**.
 
-### Get the installer from the cloud (no Windows PC needed)
+### Build the installer on Linux (no Windows PC needed)
 
-The installer is built automatically by GitHub Actions on a Windows runner, so you
-don't need a Windows machine or Python installed anywhere:
+The installer is built right here on Linux using [Wine](https://www.winehq.org/):
 
-- **Latest build:** open the repo's **Actions** tab → newest *Build Windows
-  Installer* run → download **`GoogleResultClicker-Setup`** from *Artifacts*.
-- **A shareable release:** tag a version and push it —
+```bash
+# one time only:
+sudo dnf install -y wine
 
-  ```bash
-  git tag v1.0.0
-  git push origin v1.0.0
-  ```
+# build it (downloads Windows Python + Inno Setup into a private sandbox,
+# bundles the app, and compiles the installer — all automatic):
+./build_installer.sh
+```
 
-  A GitHub **Release** is created with `GoogleResultClicker-Setup.exe` attached as a
-  download you can hand to anyone.
+The finished installer lands in **`installer-output/GoogleResultClicker-Setup.exe`** —
+a single file you copy to any Windows PC and double-click to install.
 
-### Build the installer manually on a Windows PC (optional)
+### Build the installer on a Windows PC (alternative)
 
-If you'd rather build it yourself on Windows:
+If you're on Windows instead:
 
 1. Install [Python 3](https://www.python.org/downloads/windows/) (tick *"Add
    python.exe to PATH"*) and [Inno Setup 6](https://jrsoftware.org/isdl.php).
-2. Double-click **`build.bat`** to produce `dist\GoogleResultClicker.exe`.
+2. `pip install -r requirements.txt pyinstaller`, then
+   `pyinstaller --noconfirm --clean clicker.spec` to produce
+   `dist\GoogleResultClicker.exe`.
 3. Open **`installer.iss`** in Inno Setup and click **Compile**. The finished
    installer lands in **`installer-output\GoogleResultClicker-Setup.exe`**.
 
