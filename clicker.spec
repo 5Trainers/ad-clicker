@@ -6,20 +6,26 @@
 # installed (Selenium drives a real Chrome window); chromedriver is fetched
 # automatically at first run.
 
+from PyInstaller.utils.hooks import collect_submodules, collect_data_files
+
 block_cipher = None
+
+# Selenium imports its webdriver backends dynamically (e.g.
+# selenium.webdriver.chrome.webdriver), so PyInstaller's static analysis misses
+# them. Collect ALL submodules + data files for selenium and webdriver_manager
+# so nothing is dropped.
+hidden = (
+    collect_submodules('selenium')
+    + collect_submodules('webdriver_manager')
+)
+datas = collect_data_files('selenium') + collect_data_files('webdriver_manager')
 
 a = Analysis(
     ['interactive_clicker.py'],
     pathex=[],
     binaries=[],
-    datas=[],
-    # webdriver-manager pulls these in indirectly; list them so nothing is
-    # dropped by PyInstaller's static analysis.
-    hiddenimports=[
-        'selenium',
-        'webdriver_manager',
-        'webdriver_manager.chrome',
-    ],
+    datas=datas,
+    hiddenimports=hidden,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
