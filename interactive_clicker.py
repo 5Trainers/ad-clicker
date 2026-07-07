@@ -866,11 +866,15 @@ def _strip_to_sponsored(driver) -> int:
 
 
 def run_keyword_mode(keyword: str | None, delay: float, log_path: str,
-                     prompt_keyword=None, view: str = "desktop") -> int:
-    """Lock a target result for *keyword*, then repeatedly search page 1 and
-    click that target wherever it ranks on page 1, waiting for full load before
-    closing, until the user presses Stop. *delay* is the pause between searches
-    (default 0)."""
+                     prompt_keyword=None, view: str = "desktop",
+                     should_stop=None, progress=None) -> int:
+    """Lock a target result for *keyword*, then repeatedly search and click ONLY
+    sponsored results on the locked domain, until Stop is requested from the app
+    UI (*should_stop*, a callable returning True). Every 10 searches the browser
+    is fully reset — closed and reopened with a fresh profile so ALL data
+    (cookies, cache, site data) is cleared; the CSV log is kept. *progress* (if
+    given) is called with a short status string for the app UI. *delay* is the
+    pause between searches (default 0)."""
     if not keyword:
         print("[!] Keyword mode needs a keyword.")
         return 1
@@ -879,6 +883,20 @@ def run_keyword_mode(keyword: str | None, delay: float, log_path: str,
     logger.log("kw_session_start", keyword=keyword,
                detail=f"delay={delay}s view={view}")
     driver = None
+
+    def _stopping() -> bool:
+        """True if Stop was requested from the app UI, or (fallback) via the
+        in-page Stop button while the browser is still alive."""
+        if should_stop and should_stop():
+            return True
+        return driver is not None and _stop_requested(driver)
+
+    def _report(msg: str) -> None:
+        if progress:
+            try:
+                progress(msg)
+            except Exception:
+                pass
     try:
         # Outer loop: one full attempt per keyword. A keyword whose page never
         # shows a sponsored result is dropped and we ask for another one.
@@ -927,6 +945,10 @@ def run_keyword_mode(keyword: str | None, delay: float, log_path: str,
                 # Phase 1: let the user lock a target.
                 target = None
                 while target is None:
+                    if _stopping():
+                        print("[*] Stopped before locking a target.")
+                        logger.log("kw_stopped", keyword=keyword)
+                        return 0
                     try:
                         if not driver.execute_script(
                                 "return !!window.__clickerInstalled"):
@@ -951,7 +973,9 @@ def run_keyword_mode(keyword: str | None, delay: float, log_path: str,
                 logger.log("kw_target", keyword=keyword, url=target,
                            detail=f"domain={target_domain}")
 
-                # Phase 2: search-check-click loop until Stop.
+                # Phase 2: search -> only-sponsored -> click-on-match loop.
+                # Runs until Stop is requested from the app UI. Every 10 searches
+                # the browser is fully reset (fresh profile => all data cleared).
                 try:
                     driver.execute_script(
                         "window.__beginRun && window.__beginRun();")
@@ -959,6 +983,7 @@ def run_keyword_mode(keyword: str | None, delay: float, log_path: str,
                     pass
                 clicks = [0]
                 it = 0
+                first_pass = True
                 # Keep ONE consistent user-agent for the whole session. Rotating
                 # the UA every search (and, in mobile view, overriding the mobile
                 # UA) looks like a bot and invites CAPTCHAs.
@@ -966,57 +991,64 @@ def run_keyword_mode(keyword: str | None, delay: float, log_path: str,
                     session_ua = driver.execute_script("return navigator.userAgent")
                 except WebDriverException:
                     session_ua = ""
-                while True:
-                    if _stop_requested(driver):
-                        break
+                while not _stopping():
                     it += 1
+                    _report(f"Searching #{it} • {clicks[0]} clicks")
                     try:
                         driver.execute_script(
                             "window.__setBadge && window.__setBadge(arguments[0]);",
                             f"Search {it} • {clicks[0]} clicks")
                     except WebDriverException:
-                        print("[*] Browser closed — exiting.")
-                        logger.log("browser_closed")
-                        return 0
+                        pass
                     try:
                         keyword_search_once(driver, google_tab, keyword,
                                             target_domain, logger, it, clicks,
-                                            session_ua, first=(it == 1))
+                                            session_ua, first=first_pass)
                     except WebDriverException:
                         print("[*] Browser closed — exiting.")
                         logger.log("browser_closed")
                         return 0
-                    try:
-                        driver.execute_script(
-                            "window.__setBadge && window.__setBadge(arguments[0]);",
-                            f"Search {it} done • {clicks[0]} clicks")
-                    except WebDriverException:
-                        break
+                    first_pass = False
+                    _report(f"Search {it} done • {clicks[0]} clicks")
+
+                    # Full reset every 10 searches: a brand-new browser with a
+                    # fresh profile clears ALL data (cookies/cache/site data);
+                    # the CSV log is untouched. Then resume the same keyword and
+                    # locked domain.
+                    if it % 10 == 0 and not _stopping():
+                        print(f"[*] {it} searches — full reset "
+                              f"(new browser, all data cleared).")
+                        logger.log("kw_reset", keyword=keyword, total=it,
+                                   click=clicks[0])
+                        _report(f"Reset after {it} searches • {clicks[0]} clicks")
+                        try:
+                            driver.quit()
+                        except WebDriverException:
+                            pass
+                        try:
+                            driver = build_driver(view)
+                            driver.get("https://www.google.com/ncr")
+                            dismiss_consent(driver)
+                            google_tab = driver.current_window_handle
+                            driver.execute_script(
+                                "window.__beginRun && window.__beginRun();")
+                        except WebDriverException:
+                            print("[*] Could not restart the browser — exiting.")
+                            logger.log("browser_closed")
+                            return 0
+                        first_pass = True   # fresh profile: dismiss consent again
+
                     # Optional pause between searches (default 0 = no delay).
-                    if delay > 0 and not _stop_requested(driver):
+                    if delay > 0 and not _stopping():
                         waited = 0.0
-                        while waited < delay:
-                            if _stop_requested(driver):
-                                break
+                        while waited < delay and not _stopping():
                             time.sleep(0.2)
                             waited += 0.2
 
                 print(f"[*] Stopped after {it} search(es), {clicks[0]} clicks.")
                 logger.log("kw_stopped", keyword=keyword, click=clicks[0],
                            total=it)
-                try:
-                    driver.execute_script(
-                        "window.__hideProgress && window.__hideProgress();")
-                except WebDriverException:
-                    pass
-                # Keep the window open until the user closes it.
-                print("[+] Done. Close the browser window to finish.")
-                while True:
-                    try:
-                        driver.execute_script("return 1")
-                    except WebDriverException:
-                        break
-                    time.sleep(0.5)
+                _report(f"Stopped • {it} searches • {clicks[0]} clicks")
                 return 0
             except WebDriverException:
                 print("[*] Browser closed — exiting.")
@@ -1239,6 +1271,11 @@ def _humanize_event(ev, keyword, url, click, total, detail):
         n = detail.split(":", 1)[0].replace("iter", "attempt ") if detail else ""
         extra = f" ({n})" if n else ""
         return f"    • Ad not shown that round — skipped{extra}"
+    if ev == "kw_no_ads":
+        return "    • No ad appeared — waited 5s, closed the tab"
+    if ev == "kw_reset":
+        return (f"🧹 {total} searches — cleared all data and "
+                "restarted the browser")
     if ev == "kw_refresh":
         return "↻ Refreshed the search page to look again"
     if ev == "kw_stopped":
@@ -1441,6 +1478,7 @@ def launch_gui(cfg: dict) -> int:
     from tkinter import messagebox, simpledialog, ttk
 
     session = {"active": False}
+    stop_event = threading.Event()
 
     root = tk.Tk()
     root.title("Interactive Clicker")
@@ -1486,16 +1524,23 @@ def launch_gui(cfg: dict) -> int:
         b.pack(pady=6)
         return b
 
-    def _run_session(target_fn, busy_msg):
+    def _report_status(msg):
+        """Thread-safe: update the status line from a worker thread."""
+        root.after(0, lambda: status.set(msg))
+
+    def _run_session(target_fn, busy_msg, stoppable=False):
         """Run a blocking browser session in a worker thread, toggling the
-        Open buttons so only one session runs at a time."""
+        Open buttons so only one session runs at a time. When *stoppable*, the
+        Stop button is enabled so the user can end the session from here."""
         if session["active"]:
             messagebox.showinfo("Busy", "A Chrome session is already running.")
             return
         session["active"] = True
+        stop_event.clear()
         status.set(busy_msg)
         open_btn.config(state="disabled")
         kw_btn.config(state="disabled")
+        stop_btn.config(state="normal" if stoppable else "disabled")
 
         def worker():
             try:
@@ -1507,9 +1552,18 @@ def launch_gui(cfg: dict) -> int:
                 session["active"] = False
                 root.after(0, lambda: (status.set("Ready."),
                                        open_btn.config(state="normal"),
-                                       kw_btn.config(state="normal")))
+                                       kw_btn.config(state="normal"),
+                                       stop_btn.config(state="disabled")))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def request_stop():
+        """Ask the running keyword session to stop after the current search."""
+        if not session["active"]:
+            return
+        stop_event.set()
+        status.set("Stopping… (finishing the current search)")
+        stop_btn.config(state="disabled")
 
     def open_chrome():
         view = view_var.get()
@@ -1557,8 +1611,10 @@ def launch_gui(cfg: dict) -> int:
         view = view_var.get()
         _run_session(
             lambda: run_keyword_mode(kw, cfg["kw_delay"], cfg["log"], ask_again,
-                                     view=view),
-            f"Keyword auto-click ({view}) running… (press ■ Stop in browser)")
+                                     view=view, should_stop=stop_event.is_set,
+                                     progress=_report_status),
+            f"Keyword auto-click ({view}) running… (press ■ Stop below)",
+            stoppable=True)
 
     def view_logs():
         win = tk.Toplevel(root)
@@ -1707,9 +1763,11 @@ def launch_gui(cfg: dict) -> int:
 
     open_btn = styled("▶  Open Chrome (normal)", "#16a34a", open_chrome)
     kw_btn = styled("🎯  Open Chrome (keyword)", "#0d9488", open_chrome_keyword)
+    stop_btn = styled("■  Stop", "#dc2626", request_stop)
+    stop_btn.config(state="disabled")   # enabled only during a keyword session
     styled("📄  Logs", "#2563eb", view_logs)
     styled("⚙  Settings", "#6b7280", open_settings)
-    styled("✖  Exit", "#dc2626", root.destroy)
+    styled("✖  Exit", "#6b7280", root.destroy)
 
     refresh_summary()
     root.mainloop()
