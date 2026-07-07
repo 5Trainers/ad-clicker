@@ -35,6 +35,7 @@ from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.common.exceptions import (
@@ -565,20 +566,30 @@ def keyword_search_once(driver, google_tab: str, keyword: str,
         return "no_ads"
 
     try:
-        res = driver.execute_script(CLICK_SPONSORED_BY_DOMAIN_JS, target_domain)
+        res = driver.execute_script(FIND_SPONSORED_BY_DOMAIN_JS, target_domain)
     except WebDriverException:
         res = None
     res = res or {"status": "error"}
     status = res.get("status", "error")
 
-    if status == "clicked":
-        clicks[0] += 1
-        _wait_loaded(driver, 30)   # close only after it fully loads
-        print(f"    iter {iteration}: clicked ad {res.get('domain', '')} "
-              f"-> {res.get('href', '')}")
-        logger.log("kw_click", keyword=keyword, url=res.get("href", ""),
-                   click=clicks[0], total=res.get("total", ""), user_agent=ua,
-                   detail=f"iter{iteration}:{res.get('domain', '')}")
+    if status == "found":
+        # Real browser click so Google's mousedown href-rewrite keeps ALL
+        # tracking (aclk / gclid / utm). _real_click_target also follows a
+        # new-tab ad, waits for load, closes the ad/search tabs, and returns
+        # focus to the Google tab.
+        if _real_click_target(driver, google_tab):
+            clicks[0] += 1
+            print(f"    iter {iteration}: clicked ad {res.get('domain', '')} "
+                  f"-> {res.get('href', '')}")
+            logger.log("kw_click", keyword=keyword, url=res.get("href", ""),
+                       click=clicks[0], total=res.get("total", ""),
+                       user_agent=ua,
+                       detail=f"iter{iteration}:{res.get('domain', '')}")
+            return "clicked"
+        print(f"    iter {iteration}: found ad but click failed")
+        logger.log("kw_skip", keyword=keyword, url=target_domain,
+                   total=res.get("total", ""), user_agent=ua,
+                   detail=f"iter{iteration}:click_failed")
     else:
         note = {"absent": f"domain '{target_domain}' not in sponsored results",
                 "error": "check failed"}.get(status, status)
@@ -768,10 +779,14 @@ LOCK_DOMAIN_JS = ("return (function (href) {\n" + _DOMAIN_HELPERS_JS +
   return _destDomain(anchor, block) || _hostDomain(href);
 })(arguments[0]);""")
 
-# Click the first SPONSORED (ad) result whose destination domain matches the
-# target (arguments[0]). Organic results are ignored entirely. Returns
-# {status: clicked|absent, ...}.
-CLICK_SPONSORED_BY_DOMAIN_JS = (
+# Find (do NOT click) the first SPONSORED (ad) result whose destination domain
+# matches the target (arguments[0]). Organic results are ignored entirely. The
+# matching anchor is tagged with data-clicker-hit="1" and scrolled into view so
+# the Python side can perform a REAL browser click on it. We must NOT click in
+# JS: Google rewrites an ad's href to its tracking redirect (aclk/gclid) on
+# mousedown, and a synthetic JS .click() skips mousedown, dropping all tracking.
+# Returns {status: found|absent, ...}.
+FIND_SPONSORED_BY_DOMAIN_JS = (
     "return (function (target) {\n" + _DOMAIN_HELPERS_JS + _FIND_SPONSORED_JS + r"""
   function _titleAnchor(block) {
     var h = block.querySelector('h3, [role="heading"]');
@@ -785,6 +800,8 @@ CLICK_SPONSORED_BY_DOMAIN_JS = (
     }
     return as[0] || null;
   }
+  var prev = document.querySelector('[data-clicker-hit]');
+  if (prev) { prev.removeAttribute('data-clicker-hit'); }
   var cands = [];
   _findSponsored().forEach(function (block) {
     var a = _titleAnchor(block);
@@ -795,15 +812,64 @@ CLICK_SPONSORED_BY_DOMAIN_JS = (
     var dom = _destDomain(cands[j].a, cands[j].block);
     if (_domainMatch(dom, target)) {
       var el = cands[j].a;
-      el.target = '_self';        // navigate this tab, don't spawn one
+      el.setAttribute('data-clicker-hit', '1');
       el.scrollIntoView({ block: 'center' });
-      el.click();
-      return { status: 'clicked', index: j, total: total,
-               href: el.href, domain: dom, ad: true };
+      return { status: 'found', index: j, total: total,
+               href: el.href, domain: dom };
     }
   }
   return { status: 'absent', total: total };
 })(arguments[0]);""")
+
+
+def _real_click_target(driver, google_tab: str) -> bool:
+    """Perform a REAL browser click on the anchor tagged by
+    FIND_SPONSORED_BY_DOMAIN_JS. A trusted click fires mousedown, so Google
+    rewrites the ad href to its tracking redirect (aclk/gclid) and the
+    advertiser's full final URL — with all utm/tracking — is what loads. Handles
+    the ad opening in-place OR in a new tab, waits for it to load, then closes
+    every non-Google tab and returns focus to *google_tab*. Returns True if the
+    click was performed."""
+    before = set(driver.window_handles)
+    try:
+        el = driver.find_element(By.CSS_SELECTOR, '[data-clicker-hit="1"]')
+    except WebDriverException:
+        return False
+    clicked = False
+    try:
+        el.click()                     # trusted: mousedown -> href rewrite
+        clicked = True
+    except WebDriverException:
+        try:
+            ActionChains(driver).move_to_element(el).pause(0.1).click().perform()
+            clicked = True
+        except WebDriverException:
+            clicked = False
+    if not clicked:
+        return False
+    time.sleep(1.0)
+    # If the ad opened a new tab, follow it so its tracking loads there.
+    new_tabs = [h for h in driver.window_handles if h not in before]
+    if new_tabs:
+        try:
+            driver.switch_to.window(new_tabs[-1])
+        except WebDriverException:
+            pass
+    _wait_loaded(driver, 30)           # let the advertiser page fully load
+    # Close every tab except Google, then focus Google.
+    for h in list(driver.window_handles):
+        if h == google_tab:
+            continue
+        try:
+            driver.switch_to.window(h)
+            driver.close()
+        except WebDriverException:
+            pass
+    try:
+        driver.switch_to.window(google_tab)
+    except WebDriverException:
+        pass
+    return True
 
 
 def _clear_cache(driver) -> None:
