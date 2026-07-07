@@ -266,15 +266,32 @@ class CsvLogger:
             pass
 
 
+def _profile_dir() -> str:
+    """Path to the fixed Chrome profile folder reused on every run so local
+    history and cookies persist. Lives in the user's home directory so it
+    survives no matter where the app is launched from (and when frozen to an
+    .exe). Created on first use. Not signed into any Google account."""
+    path = os.path.join(os.path.expanduser("~"),
+                        ".google_result_clicker", "chrome-profile")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
 def build_driver(view: str = "desktop") -> webdriver.Chrome:
     options = Options()
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_argument("--lang=en-US")
-    # Use a dedicated, throwaway profile so we never collide with the user's
-    # everyday Chrome (which locks the default profile).
-    options.add_argument(f"--user-data-dir={tempfile.mkdtemp(prefix='clicker-chrome-')}")
+    # Use a dedicated but PERSISTENT profile (reused every run) so local browsing
+    # history and cookies survive between sessions. It is separate from your
+    # everyday Chrome, and it is NOT signed into any Google account.
+    options.add_argument(f"--user-data-dir={_profile_dir()}")
+    # Keep a persistent profile tidy: skip first-run wizards and the
+    # "Chrome didn't shut down correctly / restore pages?" bubble.
+    options.add_argument("--no-first-run")
+    options.add_argument("--no-default-browser-check")
+    options.add_argument("--hide-crash-restore-bubble")
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
 
@@ -502,23 +519,24 @@ def _wait_loaded(driver, timeout: float) -> None:
 def keyword_search_once(driver, google_tab: str, keyword: str,
                         target_domain: str, logger: CsvLogger, iteration: int,
                         clicks, ua: str, first: bool) -> str:
-    """One pass: open a fresh tab, search page 1, and click the first result
-    (ad or organic) whose destination domain matches *target_domain*. The exact
-    URL need not match — only the domain — because ad URLs change every load.
-    Then (if clicked) wait for full load and close the tab. Returns the status
-    string. Always returns focus to *google_tab*."""
+    """One pass of the sponsored-only loop:
+      1. Clear the browser cache (keep cookies) so the search loads fresh.
+      2. Open a new tab and search the keyword.
+      3. Wait up to 5s for a SPONSORED (ad) result to appear.
+         - none within 5s -> close the tab and try again (returns "no_ads").
+      4. Among the sponsored results only, look for one whose destination
+         domain matches *target_domain*. Organic results are never clicked.
+         - match  -> click it, wait for full load, close the tab ("clicked").
+         - no match -> close the tab and try again ("absent").
+    Always returns focus to *google_tab*."""
+    _clear_cache(driver)          # fresh page load without dropping cookies
     search_url = "https://www.google.com/search?q=" + quote_plus(keyword)
     driver.switch_to.new_window("tab")
-    try:
-        driver.execute_cdp_cmd(
-            "Network.setUserAgentOverride", {"userAgent": ua})
-    except WebDriverException:
-        pass
     try:
         driver.get(search_url)
     except WebDriverException:
         pass
-    # Wait for page-1 results before scanning for the target domain.
+    # Wait for page-1 results to exist.
     try:
         WebDriverWait(driver, 15).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, "div#search, div#rso")))
@@ -527,8 +545,27 @@ def keyword_search_once(driver, google_tab: str, keyword: str,
     if first:
         dismiss_consent(driver)
 
+    # Wait up to 5s for a sponsored result (ads often render a moment late).
+    waited = 0.0
+    sponsored = _sponsored_present(driver)
+    while not sponsored and waited < 5.0:
+        time.sleep(0.5)
+        waited += 0.5
+        sponsored = _sponsored_present(driver)
+
+    if not sponsored:
+        print(f"    iter {iteration}: no sponsored result — waited 5s, closing tab")
+        logger.log("kw_no_ads", keyword=keyword, user_agent=ua,
+                   detail=f"iter{iteration}:no_ads")
+        try:
+            driver.close()
+        except WebDriverException:
+            pass
+        driver.switch_to.window(google_tab)
+        return "no_ads"
+
     try:
-        res = driver.execute_script(CLICK_BY_DOMAIN_JS, target_domain)
+        res = driver.execute_script(CLICK_SPONSORED_BY_DOMAIN_JS, target_domain)
     except WebDriverException:
         res = None
     res = res or {"status": "error"}
@@ -537,14 +574,13 @@ def keyword_search_once(driver, google_tab: str, keyword: str,
     if status == "clicked":
         clicks[0] += 1
         _wait_loaded(driver, 30)   # close only after it fully loads
-        kind = "ad" if res.get("ad") else "result"
-        print(f"    iter {iteration}: clicked {kind} {res.get('domain', '')} "
+        print(f"    iter {iteration}: clicked ad {res.get('domain', '')} "
               f"-> {res.get('href', '')}")
         logger.log("kw_click", keyword=keyword, url=res.get("href", ""),
                    click=clicks[0], total=res.get("total", ""), user_agent=ua,
                    detail=f"iter{iteration}:{res.get('domain', '')}")
     else:
-        note = {"absent": f"domain '{target_domain}' not on page 1",
+        note = {"absent": f"domain '{target_domain}' not in sponsored results",
                 "error": "check failed"}.get(status, status)
         print(f"    iter {iteration}: skip ({note})")
         logger.log("kw_skip", keyword=keyword, url=target_domain,
@@ -732,10 +768,11 @@ LOCK_DOMAIN_JS = ("return (function (href) {\n" + _DOMAIN_HELPERS_JS +
   return _destDomain(anchor, block) || _hostDomain(href);
 })(arguments[0]);""")
 
-# Click the first result (ad or organic) whose destination domain matches the
-# target (arguments[0]). Returns {status: clicked|absent, ...}.
-CLICK_BY_DOMAIN_JS = ("return (function (target) {\n" + _DOMAIN_HELPERS_JS +
-                      _FIND_SPONSORED_JS + r"""
+# Click the first SPONSORED (ad) result whose destination domain matches the
+# target (arguments[0]). Organic results are ignored entirely. Returns
+# {status: clicked|absent, ...}.
+CLICK_SPONSORED_BY_DOMAIN_JS = (
+    "return (function (target) {\n" + _DOMAIN_HELPERS_JS + _FIND_SPONSORED_JS + r"""
   function _titleAnchor(block) {
     var h = block.querySelector('h3, [role="heading"]');
     if (h) { var a = h.closest('a'); if (a && /^http/.test(a.href)) { return a; } }
@@ -751,15 +788,8 @@ CLICK_BY_DOMAIN_JS = ("return (function (target) {\n" + _DOMAIN_HELPERS_JS +
   var cands = [];
   _findSponsored().forEach(function (block) {
     var a = _titleAnchor(block);
-    if (a) { cands.push({ a: a, block: block, ad: true }); }
+    if (a) { cands.push({ a: a, block: block }); }
   });
-  var h3 = document.querySelectorAll('#search h3, #rso h3');
-  for (var i = 0; i < h3.length; i++) {
-    var a = h3[i].closest('a');
-    if (a && a.href && a.href.indexOf('http') === 0) {
-      cands.push({ a: a, block: a.closest('div'), ad: false });
-    }
-  }
   var total = cands.length;
   for (var j = 0; j < total; j++) {
     var dom = _destDomain(cands[j].a, cands[j].block);
@@ -769,11 +799,22 @@ CLICK_BY_DOMAIN_JS = ("return (function (target) {\n" + _DOMAIN_HELPERS_JS +
       el.scrollIntoView({ block: 'center' });
       el.click();
       return { status: 'clicked', index: j, total: total,
-               href: el.href, domain: dom, ad: cands[j].ad };
+               href: el.href, domain: dom, ad: true };
     }
   }
   return { status: 'absent', total: total };
 })(arguments[0]);""")
+
+
+def _clear_cache(driver) -> None:
+    """Clear the browser's disk cache but KEEP cookies. Dropping cookies makes
+    Google treat every search as a fresh anonymous session, which is the biggest
+    CAPTCHA trigger; clearing only the cache gives fresh page loads while the
+    trusted session stays intact."""
+    try:
+        driver.execute_cdp_cmd("Network.clearBrowserCache", {})
+    except WebDriverException:
+        pass
 
 
 def _target_domain(driver, href: str) -> str:
@@ -918,7 +959,13 @@ def run_keyword_mode(keyword: str | None, delay: float, log_path: str,
                     pass
                 clicks = [0]
                 it = 0
-                last_ua = None
+                # Keep ONE consistent user-agent for the whole session. Rotating
+                # the UA every search (and, in mobile view, overriding the mobile
+                # UA) looks like a bot and invites CAPTCHAs.
+                try:
+                    session_ua = driver.execute_script("return navigator.userAgent")
+                except WebDriverException:
+                    session_ua = ""
                 while True:
                     if _stop_requested(driver):
                         break
@@ -931,12 +978,10 @@ def run_keyword_mode(keyword: str | None, delay: float, log_path: str,
                         print("[*] Browser closed — exiting.")
                         logger.log("browser_closed")
                         return 0
-                    ua = pick_user_agent(last_ua)
-                    last_ua = ua
                     try:
                         keyword_search_once(driver, google_tab, keyword,
                                             target_domain, logger, it, clicks,
-                                            ua, first=(it == 1))
+                                            session_ua, first=(it == 1))
                     except WebDriverException:
                         print("[*] Browser closed — exiting.")
                         logger.log("browser_closed")
@@ -1129,6 +1174,158 @@ def read_log_table(log_path: str, tail: int = 200):
                 values.append(cell(r, key))
         rows.append(values)
     return headers, rows
+
+
+def _clock(ts: str) -> str:
+    """Turn an ISO timestamp into a friendly 12-hour clock, e.g. '5:22 PM'.
+    Platform-safe (no %-I) so it works the same on Windows and Linux."""
+    try:
+        h = int(ts[11:13])
+        m = ts[14:16]
+        ampm = "AM" if h < 12 else "PM"
+        h12 = h % 12 or 12
+        return f"{h12}:{m} {ampm}"
+    except (ValueError, IndexError):
+        return ts[11:19] or ts
+
+
+def _short_target(text: str) -> str:
+    """Strip protocol/path so a link reads as a plain site name."""
+    if not text:
+        return ""
+    t = text.split("://", 1)[-1]
+    t = t.split("/", 1)[0]
+    return t or text
+
+
+def _humanize_event(ev, keyword, url, click, total, detail):
+    """Translate one raw log event into a sentence anyone can understand."""
+    tgt = _short_target(url) or keyword
+    kw = keyword or "your keyword"
+    if ev == "session_start":
+        return "▶ Opened Chrome to start clicking"
+    if ev == "search":
+        return f"🔍 Searched Google for “{keyword}”"
+    if ev == "selected":
+        return f"👆 You picked a result to open {total} time(s): {tgt}"
+    if ev == "run_start":
+        return f"↻ Started opening {tgt} {total} time(s)"
+    if ev == "click":
+        return f"    • Opened {tgt} — {click} of {total}"
+    if ev == "run_done":
+        return f"✅ Finished opening {tgt} {total} time(s)"
+    if ev == "stopped":
+        return f"⏹ You stopped early ({click} of {total} done)"
+    if ev == "reopen_google":
+        return "↩ Went back to Google to search again"
+    if ev == "browser_closed":
+        return "🔒 Browser window closed"
+    if ev == "session_end":
+        return "🏁 Session finished"
+    # ----- keyword auto-click mode -----
+    if ev == "kw_session_start":
+        return f"▶ Started auto-clicking ads for “{kw}”"
+    if ev == "kw_sponsored":
+        return f"📢 Found {total} sponsored (ad) result(s) on the page"
+    if ev == "kw_no_sponsored":
+        return f"🚫 No ad appeared for “{kw}” this time"
+    if ev == "kw_retry":
+        return f"🔁 Trying another keyword: “{kw}”"
+    if ev == "kw_target":
+        return f"🎯 Locked onto this ad: {tgt}"
+    if ev == "kw_click":
+        return f"    ✔ Clicked the ad: {tgt}"
+    if ev == "kw_skip":
+        n = detail.split(":", 1)[0].replace("iter", "attempt ") if detail else ""
+        extra = f" ({n})" if n else ""
+        return f"    • Ad not shown that round — skipped{extra}"
+    if ev == "kw_refresh":
+        return "↻ Refreshed the search page to look again"
+    if ev == "kw_stopped":
+        return f"⏹ Stopped after {total} search(es)"
+    if ev == "kw_session_end":
+        return "🏁 Session finished"
+    # anything unknown: show it plainly rather than hide it
+    return f"{ev} {tgt}".strip()
+
+
+def read_log_runs(log_path: str):
+    """Group raw log rows into human-friendly *runs* (one per time the tool was
+    used). Returns a list newest-first; each run is a dict with a title,
+    subtitle summary, clock range, and a list of (clock, sentence) events."""
+    if not os.path.exists(log_path):
+        return []
+    try:
+        with open(log_path, encoding="utf-8") as fh:
+            raw = list(csv.reader(fh))
+    except OSError:
+        return []
+    if len(raw) <= 1:
+        return []
+    header, data = raw[0], raw[1:]
+    idx = {name: i for i, name in enumerate(header)}
+
+    def cell(row, name):
+        i = idx.get(name)
+        return row[i] if i is not None and i < len(row) else ""
+
+    starts = {"session_start", "kw_session_start"}
+
+    def new_run(row):
+        ev = cell(row, "event")
+        return {"kind": "keyword" if ev.startswith("kw") else "normal",
+                "start": cell(row, "timestamp"),
+                "end": cell(row, "timestamp"), "rows": []}
+
+    runs, current = [], None
+    for row in data:
+        if cell(row, "event") in starts:
+            if current:
+                runs.append(current)
+            current = new_run(row)
+        elif current is None:               # stray events before any start
+            current = new_run(row)
+        current["rows"].append(row)
+        current["end"] = cell(row, "timestamp") or current["end"]
+    if current:
+        runs.append(current)
+
+    result = []
+    for i, run in enumerate(runs, 1):
+        rows = run["rows"]
+        kw = next((cell(r, "keyword") for r in rows if cell(r, "keyword")), "")
+        events = [(_clock(cell(r, "timestamp")),
+                   _humanize_event(cell(r, "event"), cell(r, "keyword"),
+                                   cell(r, "url"), cell(r, "click"),
+                                   cell(r, "total"), cell(r, "detail")))
+                  for r in rows]
+        if run["kind"] == "keyword":
+            ads = sum(1 for r in rows if cell(r, "event") == "kw_click")
+            tries = sum(1 for r in rows
+                        if cell(r, "event") in ("kw_click", "kw_skip"))
+            title = f"Run {i} · Ad auto-click"
+            kwtxt = f"“{kw}”  " if kw else ""
+            subtitle = (f"{kwtxt}{ads} ad{'' if ads == 1 else 's'} clicked"
+                        f" over {tries} tr{'y' if tries == 1 else 'ies'}")
+        else:
+            opens = sum(1 for r in rows if cell(r, "event") == "click")
+            title = f"Run {i} · Manual clicking"
+            kwtxt = f"“{kw}”  " if kw else ""
+            subtitle = f"{kwtxt}{opens} link-open{'' if opens == 1 else 's'}"
+        result.append({
+            "title": title, "subtitle": subtitle,
+            "when": f"{_clock(run['start'])} → {_clock(run['end'])}",
+            "kind": run["kind"], "events": events,
+        })
+    result.reverse()                        # newest run first
+    return result
+
+
+def clear_log(log_path: str) -> None:
+    """Erase all recorded activity, leaving an empty log with just its header.
+    A fresh header keeps the file valid so the next run appends cleanly."""
+    with open(log_path, "w", newline="", encoding="utf-8") as fh:
+        csv.DictWriter(fh, fieldnames=LOG_FIELDS).writeheader()
 
 
 def format_logs(log_path: str, tail: int = 50) -> str:
@@ -1325,14 +1522,14 @@ def launch_gui(cfg: dict) -> int:
         if session["active"]:
             messagebox.showinfo("Busy", "A Chrome session is already running.")
             return
-        kw = simpledialog.askstring(
-            "Keyword auto-click",
-            "Keyword to search and auto-click:",
-            initialvalue=cfg["keyword"], parent=root)
-        if not kw or not kw.strip():
+        # Always use the default keyword from Settings — never prompt here.
+        kw = (cfg["keyword"] or "").strip()
+        if not kw:
+            messagebox.showinfo(
+                "No default keyword",
+                "No default keyword is set.\n"
+                "Open ⚙ Settings and set a Default keyword first.")
             return
-        kw = kw.strip()
-        cfg["keyword"] = kw
 
         def ask_again(current):
             """Called from the worker thread when a keyword shows no sponsored
@@ -1365,59 +1562,104 @@ def launch_gui(cfg: dict) -> int:
 
     def view_logs():
         win = tk.Toplevel(root)
-        win.title("Logs")
-        win.geometry("1000x540")
+        win.title("Activity log — what happened, run by run")
+        win.geometry("780x580")
+        win.configure(bg="#0f172a")
+
+        tk.Label(win, text="Activity log", font=("Arial", 16, "bold"),
+                 fg="#f1f5f9", bg="#0f172a").pack(anchor="w", padx=14,
+                                                  pady=(12, 0))
+        tk.Label(win, text="Each grey block is one time you used the tool. "
+                 "Click a block to open or close its step-by-step details.",
+                 font=("Arial", 9), fg="#94a3b8", bg="#0f172a",
+                 justify="left").pack(anchor="w", padx=14, pady=(2, 8))
 
         style = ttk.Style(win)
         try:
-            style.theme_use("clam")          # draws clean cell/grid borders
+            style.theme_use("clam")
         except tk.TclError:
             pass
-        style.configure("Logs.Treeview", rowheight=24, font=("Arial", 10),
-                        borderwidth=1, relief="solid", fieldbackground="#ffffff")
-        style.configure("Logs.Treeview.Heading", font=("Arial", 10, "bold"),
+        style.configure("Runs.Treeview", rowheight=26, font=("Arial", 10),
+                        background="#ffffff", fieldbackground="#ffffff")
+        style.configure("Runs.Treeview.Heading", font=("Arial", 10, "bold"),
                         background="#d7dde5", relief="raised")
 
-        frame = tk.Frame(win)
-        frame.pack(fill="both", expand=True, padx=8, pady=(8, 0))
+        frame = tk.Frame(win, bg="#0f172a")
+        frame.pack(fill="both", expand=True, padx=10, pady=(0, 4))
 
-        headers = [title for title, _ in LOG_COLUMNS]
-        widths = {"Time": 74, "Event": 120, "Keyword": 170, "Click": 54,
-                  "Total": 54, "URL / Target": 300, "User agent": 230,
-                  "Detail": 180}
-        centered = {"Click", "Total"}
-        tree = ttk.Treeview(frame, columns=headers, show="headings",
-                            style="Logs.Treeview")
-        for h in headers:
-            tree.heading(h, text=h)
-            tree.column(h, width=widths.get(h, 120), minwidth=40,
-                        anchor="center" if h in centered else "w",
-                        stretch=False)
+        tree = ttk.Treeview(frame, columns=("time",), show="tree headings",
+                            style="Runs.Treeview")
+        tree.heading("#0", text="What happened")
+        tree.heading("time", text="Time")
+        tree.column("#0", width=580, minwidth=260, stretch=True)
+        tree.column("time", width=150, minwidth=90, anchor="w", stretch=False)
 
         ysb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
-        xsb = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
-        tree.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
+        tree.configure(yscrollcommand=ysb.set)
         tree.grid(row=0, column=0, sticky="nsew")
         ysb.grid(row=0, column=1, sticky="ns")
-        xsb.grid(row=1, column=0, sticky="ew")
         frame.rowconfigure(0, weight=1)
         frame.columnconfigure(0, weight=1)
 
-        tree.tag_configure("odd", background="#ffffff")
-        tree.tag_configure("even", background="#eef2f7")   # Excel-style banding
+        # Each run block is tinted by mode so the two kinds are easy to tell
+        # apart; the events inside stay plain white.
+        tree.tag_configure("run_kw", background="#ccfbf1",
+                           font=("Arial", 10, "bold"))
+        tree.tag_configure("run_normal", background="#dbeafe",
+                           font=("Arial", 10, "bold"))
 
         def reload():
             tree.delete(*tree.get_children())
-            _, rows = read_log_table(cfg["log"])
-            for i, vals in enumerate(rows):
-                tree.insert("", "end", values=vals,
-                            tags=("even" if i % 2 else "odd",))
-            kids = tree.get_children()
-            if kids:
-                tree.see(kids[-1])           # jump to the latest entry
+            runs = read_log_runs(cfg["log"])
+            if not runs:
+                tree.insert("", "end",
+                            text="  (No activity yet — open Chrome and click "
+                                 "something first.)")
+                return
+            for run in runs:
+                tag = "run_kw" if run["kind"] == "keyword" else "run_normal"
+                parent = tree.insert(
+                    "", "end", open=True, tags=(tag,),
+                    text=f"  {run['title']}   —   {run['subtitle']}",
+                    values=(run["when"],))
+                for clock, text in run["events"]:
+                    tree.insert(parent, "end", text=text, values=(clock,))
 
         reload()
-        tk.Button(win, text="Refresh", command=reload).pack(pady=6)
+
+        def _set_all(open_):
+            for p in tree.get_children():
+                tree.item(p, open=open_)
+
+        def clear_logs():
+            if session["active"]:
+                messagebox.showinfo(
+                    "Chrome is running",
+                    "Close the current Chrome session before clearing the log.")
+                return
+            if not messagebox.askyesno(
+                    "Clear all logs?",
+                    "This permanently erases every recorded run.\n"
+                    "This cannot be undone. Continue?",
+                    icon="warning", parent=win):
+                return
+            try:
+                clear_log(cfg["log"])
+            except OSError as exc:
+                messagebox.showerror("Could not clear", str(exc), parent=win)
+                return
+            reload()
+
+        btns = tk.Frame(win, bg="#0f172a")
+        btns.pack(fill="x", padx=10, pady=8)
+        tk.Button(btns, text="↻ Refresh", command=reload).pack(side="left")
+        tk.Button(btns, text="Collapse all",
+                  command=lambda: _set_all(False)).pack(side="left", padx=6)
+        tk.Button(btns, text="Expand all",
+                  command=lambda: _set_all(True)).pack(side="left")
+        tk.Button(btns, text="🗑 Clear logs", fg="#ffffff", bg="#dc2626",
+                  activebackground="#b91c1c", relief="flat",
+                  command=clear_logs).pack(side="right")
 
     def open_settings():
         win = tk.Toplevel(root)
